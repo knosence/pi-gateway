@@ -2,6 +2,10 @@
 
 Hermes-style messaging gateway for [pi-coding-agent](https://github.com/badlogic/pi-mono) — multi-platform session management, security, and background tasks.
 
+> Fork note: this fork includes smarter startup recovery for port conflicts (`EADDRINUSE`).
+> It can inspect the conflicting listener, attach to an existing pi gateway, retry on another port,
+> prompt for a custom port, or terminate/replace the blocking process with optional `SIGKILL` escalation.
+
 ## Installation
 
 ```bash
@@ -23,6 +27,7 @@ pi install npm:@0xkobold/pi-kobold
 - **Security** — Per-platform user allowlists and DM pairing flow
 - **Rate Limiting** — Configurable per-identifier rate limiting
 - **Multi-Platform Adapters** — Discord, Telegram, Slack, WhatsApp, Twitch, WebSocket
+- **Interactive Port Conflict Recovery** — Smarter recovery when the gateway port is already in use
 
 ## Architecture
 
@@ -97,6 +102,7 @@ await stopGateway();
 | `getAdapter(platform)` | Get a platform adapter by name |
 | `getAdapters()` | Get all active adapters |
 | `sendMessage(platform, channelId, content)` | Send a message through a platform adapter |
+| `attachToExistingGateway(port?, host?)` | Attach to an already-running gateway without owning its process |
 | `broadcast(event, data)` | Broadcast to all connected WebSocket clients |
 
 ### Start Options
@@ -169,10 +175,22 @@ Data is stored in SQLite via [sql.js](https://github.com/nicolo-ribaudo/nicolo-n
 - `~/.0xkobold/gateway-security.db` — Allowlist, pairing codes, rate limits
 - `~/.0xkobold/gateway-background-tasks.db` — Background task records
 
+## Port Conflict Recovery
+
+When startup hits `EADDRINUSE`, the gateway can now:
+
+- detect the PID and command holding the port
+- detect whether the listener is another pi gateway
+- attach to an existing gateway instead of spawning a duplicate
+- retry on the next suggested port
+- prompt for a custom port
+- terminate the blocking process with `SIGTERM`
+- offer `SIGKILL` if the process does not exit cleanly
+
 ## Local Development
 
 ```bash
-git clone https://github.com/0xKobold/pi-gateway
+git clone https://github.com/knosence/pi-gateway
 cd pi-gateway
 npm install
 npm run build

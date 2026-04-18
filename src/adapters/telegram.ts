@@ -8,7 +8,12 @@
  * - Callback buttons
  */
 
+import { setDefaultResultOrder } from "node:dns";
+import { Agent } from "undici";
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+
+setDefaultResultOrder("ipv4first");
+const TELEGRAM_IPV4_AGENT = new Agent({ connect: { family: 4 } });
 
 interface TelegramConfig extends PlatformConfig {
   platform: "telegram";
@@ -30,6 +35,18 @@ interface TelegramMessage {
   caption?: string;
   date: number;
   entities?: Array<{ type: string; offset: number; length: number }>;
+}
+
+interface TelegramUpdate {
+  update_id: number;
+  message?: TelegramMessage;
+  edited_message?: TelegramMessage;
+  callback_query?: {
+    id: string;
+    data?: string;
+    from: { id: number; username?: string };
+    message?: { date?: number; chat?: { id: number } };
+  };
 }
 
 export class TelegramAdapter extends BaseAdapter {
@@ -70,17 +87,40 @@ export class TelegramAdapter extends BaseAdapter {
       });
       console.log(`[Telegram] Webhook set: ${this.config.webhookUrl}`);
     }
+
+    // Clear webhook when using polling to avoid getUpdates conflicts
+    if (this.config.mode === "polling") {
+      try {
+        await this.apiRequest("/deleteWebhook", {
+          method: "POST",
+          body: JSON.stringify({ drop_pending_updates: false }),
+        });
+      } catch (err) {
+        console.warn("[Telegram] Failed to clear webhook before polling:", err);
+      }
+    }
   }
 
   private async apiRequest(endpoint: string, options: RequestInit = {}): Promise<Response> {
     const url = `https://api.telegram.org/bot${this.config.token}${endpoint}`;
-    return fetch(url, {
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-      },
-    });
+    const controller = new AbortController();
+    const timeoutMs = endpoint === "/getUpdates" ? 45000 : 20000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(url, {
+        ...options,
+        // Force IPv4 to avoid broken IPv6 routes timing out to api.telegram.org
+        dispatcher: TELEGRAM_IPV4_AGENT,
+        signal: options.signal ?? controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+        },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async start(callbacks): Promise<void> {
@@ -114,12 +154,18 @@ export class TelegramAdapter extends BaseAdapter {
           continue;
         }
 
-        const data = await response.json() as { ok: boolean; result?: TelegramMessage[] };
+        const data = await response.json() as { ok: boolean; result?: TelegramUpdate[]; description?: string };
 
-        if (data.ok && data.result && data.result.length > 0) {
+        if (!data.ok) {
+          console.error(`[Telegram] Poll API error: ${data.description || "unknown error"}`);
+          await this.sleep(5000);
+          continue;
+        }
+
+        if (data.result && data.result.length > 0) {
           for (const update of data.result) {
             await this.handleUpdate(update);
-            this.offset = update.message_id + 1;
+            this.offset = update.update_id + 1;
           }
         }
       } catch (err) {
@@ -211,7 +257,7 @@ export class TelegramAdapter extends BaseAdapter {
   }
 
   async sendMessage(channelId: string, content: string): Promise<string> {
-    const response = await this.apiRequest("/sendMessage", {
+    let response = await this.apiRequest("/sendMessage", {
       method: "POST",
       body: JSON.stringify({
         chat_id: channelId,
@@ -220,10 +266,22 @@ export class TelegramAdapter extends BaseAdapter {
       }),
     });
 
-    const data = await response.json() as { ok: boolean; result?: { message_id: number } };
+    let data = await response.json() as { ok: boolean; description?: string; result?: { message_id: number } };
 
     if (!data.ok) {
-      throw new Error(`Failed to send message: ${data}`);
+      console.warn(`[Telegram] HTML send failed, retrying as plain text: ${data.description || "unknown error"}`);
+      response = await this.apiRequest("/sendMessage", {
+        method: "POST",
+        body: JSON.stringify({
+          chat_id: channelId,
+          text: content,
+        }),
+      });
+      data = await response.json() as { ok: boolean; description?: string; result?: { message_id: number } };
+    }
+
+    if (!data.ok) {
+      throw new Error(`Failed to send message: ${data.description || "unknown error"}`);
     }
 
     return String(data.result?.message_id || 0);

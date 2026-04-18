@@ -1,17 +1,6 @@
-/**
- * Background Task Manager - Hermes-style background session handling
- * 
- * Features:
- * - Isolated sessions for background tasks
- * - Result delivery to parent session
- * - Progress notifications
- * - Timeout handling
- */
-
-import { Database } from "bun:sqlite";
+import { Database } from "../db.js";
 import { join } from "path";
 import { homedir } from "os";
-import { existsSync, mkdirSync } from "fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createBackgroundSession, type SessionConfig } from "../sessions/store.js";
 import { randomBytes } from "node:crypto";
@@ -57,20 +46,11 @@ let db: Database | null = null;
 const runningProcesses: Map<string, ChildProcess> = new Map();
 const progressCallbacks: Map<string, (task: BackgroundTask) => void> = new Map();
 
-/**
- * Initialize background tasks database
- */
-export function initBackgroundTasks(): Database {
+export async function initBackgroundTasks(): Promise<Database> {
   if (db) return db;
 
-  if (!existsSync(KOBOLD_DIR)) {
-    mkdirSync(KOBOLD_DIR, { recursive: true });
-  }
+  db = await Database.open(TASKS_DB);
 
-  db = new Database(TASKS_DB);
-  db.run("PRAGMA journal_mode = WAL;");
-
-  // Tasks table
   db.run(`
     CREATE TABLE IF NOT EXISTS background_tasks (
       id TEXT PRIMARY KEY,
@@ -89,7 +69,6 @@ export function initBackgroundTasks(): Database {
     )
   `);
 
-  // Indexes
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_parent ON background_tasks(parent_session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON background_tasks(status)`);
 
@@ -97,23 +76,18 @@ export function initBackgroundTasks(): Database {
   return db;
 }
 
-/**
- * Start a background task
- */
-export function startBackgroundTask(
+export async function startBackgroundTask(
   parentSessionId: string,
   command: string,
   onProgress?: (task: BackgroundTask) => void
-): BackgroundTask {
-  const database = initBackgroundTasks();
-  
+): Promise<BackgroundTask> {
+  const database = await initBackgroundTasks();
+
   const id = `bg-${Date.now()}-${randomBytes(4).toString("hex")}`;
   const now = Date.now();
 
-  // Create background session
-  const session = createBackgroundSession("background", id, "system", parentSessionId);
+  const session = await createBackgroundSession("background", id, "system", parentSessionId);
 
-  // Create task record
   const task: BackgroundTask = {
     id,
     sessionId: session.id,
@@ -125,18 +99,16 @@ export function startBackgroundTask(
   };
 
   database.run(`
-    INSERT INTO background_tasks 
+    INSERT INTO background_tasks
     (id, session_id, parent_session_id, command, status, progress, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `, [id, session.id, parentSessionId, command, "running", 0, now]);
 
-  // Register progress callback
   if (onProgress) {
     progressCallbacks.set(id, onProgress);
   }
 
-  // Start the actual process
-  const proc = spawn("pi", ["--json", "--no-stream", command], {
+  const proc = spawn("pi", ["--mode", "json", "--no-extensions", "--offline", "-p", command], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env },
   });
@@ -148,8 +120,7 @@ export function startBackgroundTask(
 
   proc.stdout?.on("data", (data: Buffer) => {
     stdout += data.toString();
-    
-    // Parse progress updates
+
     try {
       const lines = stdout.split("\n").filter(Boolean);
       for (const line of lines) {
@@ -169,7 +140,7 @@ export function startBackgroundTask(
 
   proc.on("close", (code) => {
     runningProcesses.delete(id);
-    
+
     if (code === 0) {
       try {
         const result = stdout.trim() ? JSON.parse(stdout) : { success: true };
@@ -191,34 +162,27 @@ export function startBackgroundTask(
   return task;
 }
 
-/**
- * Update task progress
- */
-export function updateTaskProgress(taskId: string, progress: number, message?: string): void {
-  const database = initBackgroundTasks();
-  
+export async function updateTaskProgress(taskId: string, progress: number, message?: string): Promise<void> {
+  const database = await initBackgroundTasks();
+
   database.run(`
     UPDATE background_tasks SET progress = ?, progress_message = ?
     WHERE id = ?
   `, [progress, message ?? null, taskId]);
 
-  // Notify via callback
   const callback = progressCallbacks.get(taskId);
   if (callback) {
-    const task = getTask(taskId);
+    const task = await getTask(taskId);
     if (task) callback(task);
   }
 }
 
-/**
- * Complete a task successfully
- */
-export function completeTask(taskId: string, result: unknown): void {
-  const database = initBackgroundTasks();
+export async function completeTask(taskId: string, result: unknown): Promise<void> {
+  const database = await initBackgroundTasks();
   const now = Date.now();
 
   database.run(`
-    UPDATE background_tasks 
+    UPDATE background_tasks
     SET status = 'completed', progress = 100, result = ?, completed_at = ?
     WHERE id = ?
   `, [JSON.stringify(result), now, taskId]);
@@ -226,15 +190,12 @@ export function completeTask(taskId: string, result: unknown): void {
   console.log(`[BackgroundTasks] Task ${taskId.slice(0, 12)}... completed`);
 }
 
-/**
- * Fail a task
- */
-export function failTask(taskId: string, error: string): void {
-  const database = initBackgroundTasks();
+export async function failTask(taskId: string, error: string): Promise<void> {
+  const database = await initBackgroundTasks();
   const now = Date.now();
 
   database.run(`
-    UPDATE background_tasks 
+    UPDATE background_tasks
     SET status = 'failed', error = ?, completed_at = ?
     WHERE id = ?
   `, [error, now, taskId]);
@@ -242,90 +203,71 @@ export function failTask(taskId: string, error: string): void {
   console.log(`[BackgroundTasks] Task ${taskId.slice(0, 12)}... failed: ${error}`);
 }
 
-/**
- * Mark task as delivered to user
- */
-export function markTaskDelivered(taskId: string): void {
-  const database = initBackgroundTasks();
+export async function markTaskDelivered(taskId: string): Promise<void> {
+  const database = await initBackgroundTasks();
   database.run(`
     UPDATE background_tasks SET status = 'delivered', delivered_at = ?
     WHERE id = ?
   `, [Date.now(), taskId]);
 }
 
-/**
- * Get task by ID
- */
-export function getTask(taskId: string): BackgroundTask | null {
-  const database = initBackgroundTasks();
-  const row = database.query("SELECT * FROM background_tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+export async function getTask(taskId: string): Promise<BackgroundTask | null> {
+  const database = await initBackgroundTasks();
+  const row = database.query("SELECT * FROM background_tasks WHERE id = ?").get(taskId) as unknown as TaskRow | undefined;
   return row ? rowToTask(row) : null;
 }
 
-/**
- * Get pending results for parent session
- */
-export function getPendingResultsForSession(parentSessionId: string): BackgroundTask[] {
-  const database = initBackgroundTasks();
-  
+export async function getPendingResultsForSession(parentSessionId: string): Promise<BackgroundTask[]> {
+  const database = await initBackgroundTasks();
+
   const rows = database.query(`
-    SELECT * FROM background_tasks 
+    SELECT * FROM background_tasks
     WHERE parent_session_id = ? AND status IN ('completed', 'failed')
     AND delivered_at IS NULL
     ORDER BY created_at ASC
-  `).all(parentSessionId) as TaskRow[];
+  `).all(parentSessionId) as unknown as TaskRow[];
 
   return rows.map(rowToTask);
 }
 
-/**
- * List all tasks
- */
-export function listTasks(status?: BackgroundStatus): BackgroundTask[] {
-  const database = initBackgroundTasks();
-  
-  const query = status 
+export async function listTasks(status?: BackgroundStatus): Promise<BackgroundTask[]> {
+  const database = await initBackgroundTasks();
+
+  const query = status
     ? "SELECT * FROM background_tasks WHERE status = ? ORDER BY created_at DESC"
     : "SELECT * FROM background_tasks ORDER BY created_at DESC";
-  
-  const rows = status 
-    ? database.query(query).all(status) as TaskRow[]
-    : database.query(query).all() as TaskRow[];
-  
+
+  const rows = status
+    ? database.query(query).all(status) as unknown as TaskRow[]
+    : database.query(query).all() as unknown as TaskRow[];
+
   return rows.map(rowToTask);
 }
 
-/**
- * Cancel a running task
- */
-export function cancelTask(taskId: string): boolean {
+export async function cancelTask(taskId: string): Promise<boolean> {
   const proc = runningProcesses.get(taskId);
   if (proc) {
     proc.kill("SIGTERM");
     runningProcesses.delete(taskId);
-    
-    const database = initBackgroundTasks();
+
+    const database = await initBackgroundTasks();
     database.run(`
       UPDATE background_tasks SET status = 'failed', error = ?, completed_at = ?
       WHERE id = ?
     `, ["Cancelled by user", Date.now(), taskId]);
-    
+
     return true;
   }
   return false;
 }
 
-/**
- * Clean up old tasks
- */
-export function cleanupOldTasks(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): number {
-  const database = initBackgroundTasks();
+export async function cleanupOldTasks(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): Promise<number> {
+  const database = await initBackgroundTasks();
   const cutoff = Date.now() - maxAgeMs;
   const result = database.run("DELETE FROM background_tasks WHERE created_at < ?", [cutoff]);
   return result.changes;
 }
 
-// Helper to convert DB row to BackgroundTask
 function rowToTask(row: TaskRow): BackgroundTask {
   return {
     id: row.id,

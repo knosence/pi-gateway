@@ -21,6 +21,7 @@ import { randomBytes } from "node:crypto";
 import {
   initSessionStore,
   getOrCreateSession,
+  getSession,
   listSessions,
   touchSession,
   type SessionConfig,
@@ -54,6 +55,7 @@ const KOBOLD_DIR = join(homedir(), ".0xkobold");
 const CONFIG_DIR = join(KOBOLD_DIR, "gateway");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const PI_STDERR_LOG = join(CONFIG_DIR, "pi-stderr.log");
+const LIVE_BRIDGE_CONFIG_FILE = join(homedir(), ".pi", "agent", "live-session-bridge.json");
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Types
@@ -74,6 +76,15 @@ export interface GatewayConfig {
     resetPolicy: "daily" | "idle" | "both";
     dailyHour: number;
     idleMinutes: number;
+    bindings?: Record<string, string>;
+  };
+  liveBridge?: {
+    enabled: boolean;
+    url: string;
+    token: string;
+    timeoutMs?: number;
+    telegramMode?: "clean" | "persistent";
+    autoDiscover?: boolean;
   };
   platforms: {
     discord?: { enabled: boolean; botToken: string; guildId?: string };
@@ -113,7 +124,8 @@ const DEFAULT_CONFIG: GatewayConfig = {
   enableWebSocket: true,
   enableHttp: true,
   security: { allowAll: true, requirePairing: false },
-  sessions: { resetPolicy: "idle", dailyHour: 4, idleMinutes: 1440 },
+  sessions: { resetPolicy: "idle", dailyHour: 4, idleMinutes: 1440, bindings: {} },
+  liveBridge: { enabled: false, url: "http://127.0.0.1:8766", token: "", timeoutMs: 600000, telegramMode: "clean", autoDiscover: true },
   platforms: {},
 };
 
@@ -129,6 +141,7 @@ let cronInterval: ReturnType<typeof setInterval> | null = null;
 let storesInitialized = false;
 let attachedGateway: Record<string, unknown> | null = null;
 const pendingPromptSessions: SessionConfig[] = [];
+const typingCounts = new Map<string, number>();
 
 interface PendingRequest {
   id: string;
@@ -141,13 +154,40 @@ const pendingRequests: PendingRequest[] = [];
 // Internal helpers
 // ═════════════════════════════════════════════════════════════════════════════
 
+function syncLiveBridgeConfigFromFile(nextConfig: GatewayConfig): GatewayConfig {
+  const bridge = nextConfig.liveBridge;
+  if (!bridge?.enabled || bridge.autoDiscover === false) return nextConfig;
+  try {
+    if (!existsSync(LIVE_BRIDGE_CONFIG_FILE)) return nextConfig;
+    const parsed = JSON.parse(readFileSync(LIVE_BRIDGE_CONFIG_FILE, "utf-8")) as Partial<{
+      host: string;
+      port: number;
+      token: string;
+      timeoutMs: number;
+      autoStart: boolean;
+    }>;
+    if (!parsed.host || !parsed.port || !parsed.token) return nextConfig;
+    return {
+      ...nextConfig,
+      liveBridge: {
+        ...bridge,
+        url: `http://${parsed.host}:${parsed.port}`,
+        token: parsed.token,
+        timeoutMs: parsed.timeoutMs ?? bridge.timeoutMs ?? 600000,
+      },
+    };
+  } catch {
+    return nextConfig;
+  }
+}
+
 function loadConfig(): GatewayConfig {
   try {
     if (existsSync(CONFIG_FILE)) {
-      return { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) };
+      return syncLiveBridgeConfigFromFile({ ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) });
     }
   } catch { /* ignore */ }
-  return { ...DEFAULT_CONFIG };
+  return syncLiveBridgeConfigFromFile({ ...DEFAULT_CONFIG });
 }
 
 function saveConfig(): void {
@@ -181,8 +221,7 @@ function broadcastClients(event: string, data: unknown): void {
   }
 }
 
-function extractAssistantText(msg: any): string {
-  const message = msg?.message;
+function extractAssistantTextFromMessage(message: any): string {
   if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
     return "";
   }
@@ -194,32 +233,214 @@ function extractAssistantText(msg: any): string {
     .trim();
 }
 
-async function deliverPromptResult(session: SessionConfig | undefined, msg: any): Promise<void> {
-  if (!session) return;
+function extractAssistantText(msg: any): string {
+  return extractAssistantTextFromMessage(msg?.message);
+}
 
-  let text = extractAssistantText(msg);
-  if (!text && rpcProcess) {
-    try {
-      const last = await sendRpc("get_last_assistant_text") as { success?: boolean; data?: { text?: string } };
-      text = last?.data?.text?.trim() || "";
-    } catch (err) {
-      console.error("[gateway] Failed to fetch last assistant text:", err);
-    }
+function extractLastAssistantTextFromMessages(messages: any[]): string {
+  if (!Array.isArray(messages)) return "";
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const text = extractAssistantTextFromMessage(messages[i]);
+    if (text) return text;
   }
 
-  if (!text) {
-    console.warn(`[gateway] No assistant text to deliver for ${session.platform}:${session.channelId}`);
+  return "";
+}
+
+function isFinalAssistantMessage(msg: any): boolean {
+  const message = msg?.message;
+  return message?.role === "assistant" && message?.stopReason === "stop" && !!extractAssistantTextFromMessage(message);
+}
+
+function getTypingKey(session: SessionConfig): string {
+  return `${session.platform}:${session.channelId}`;
+}
+
+function getBindingKey(platform: string, channelId: string): string {
+  return `${platform}:${channelId}`;
+}
+
+async function resolveInboundSession(message: PlatformMessage): Promise<SessionConfig> {
+  const bindingKey = getBindingKey(message.platform, message.channelId);
+  const boundSessionId = config.sessions.bindings?.[bindingKey];
+
+  if (boundSessionId) {
+    const boundSession = await getSession(boundSessionId);
+    if (boundSession) {
+      await touchSession(boundSession.id);
+      return boundSession;
+    }
+
+    return {
+      id: boundSessionId,
+      platform: message.platform,
+      channelId: message.channelId,
+      userId: message.userId,
+      resetPolicy: config.sessions.resetPolicy,
+      dailyHour: config.sessions.dailyHour,
+      idleMinutes: config.sessions.idleMinutes,
+      lastActivity: Date.now(),
+      createdAt: Date.now(),
+      isBackground: false,
+    };
+  }
+
+  return getOrCreateSession(message.platform, message.channelId, message.userId, {
+    resetPolicy: config.sessions.resetPolicy,
+    dailyHour: config.sessions.dailyHour,
+    idleMinutes: config.sessions.idleMinutes,
+  });
+}
+
+async function updateTyping(session: SessionConfig | undefined, delta: 1 | -1): Promise<void> {
+  if (!session) return;
+
+  const key = getTypingKey(session);
+  const current = typingCounts.get(key) || 0;
+  const next = Math.max(0, current + delta);
+  const adapter = adapters.get(session.platform);
+
+  if (!adapter) {
+    if (next === 0) typingCounts.delete(key);
+    else typingCounts.set(key, next);
     return;
   }
 
-  const adapter = adapters.get(session.platform);
-  if (!adapter) return;
+  try {
+    if (delta > 0 && current === 0) {
+      await adapter.setTyping(session.channelId, true);
+    } else if (delta < 0 && next === 0 && current > 0) {
+      await adapter.setTyping(session.channelId, false);
+    }
+  } catch (err) {
+    console.error(`[gateway] Failed to update typing for ${key}:`, err);
+  }
+
+  if (next === 0) typingCounts.delete(key);
+  else typingCounts.set(key, next);
+}
+
+async function promptViaLiveBridge(message: string): Promise<string> {
+  config = syncLiveBridgeConfigFromFile(config);
+  const bridge = config.liveBridge;
+  if (!bridge?.enabled) throw new Error("Live bridge not enabled");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), bridge.timeoutMs ?? 600000);
 
   try {
-    console.log(`[gateway] Delivering response to ${session.platform}:${session.channelId}`);
-    await adapter.sendMessage(session.channelId, text);
-  } catch (err) {
-    console.error(`[gateway] Failed to deliver response to ${session.platform}:${session.channelId}:`, err);
+    const response = await fetch(`${bridge.url.replace(/\/$/, "")}/prompt`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${bridge.token}`,
+      },
+      body: JSON.stringify({ message }),
+      signal: controller.signal,
+    });
+
+    const data = await response.json() as { ok?: boolean; text?: string; error?: string };
+    if (!response.ok || !data?.ok || typeof data.text !== "string") {
+      throw new Error(data?.error || `Live bridge request failed with ${response.status}`);
+    }
+
+    return data.text.trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function promptViaLiveBridgeStream(
+  message: string,
+  onEvent: (event: { type?: string; text?: string; error?: string; toolName?: string }) => Promise<void> | void,
+): Promise<string> {
+  config = syncLiveBridgeConfigFromFile(config);
+  const bridge = config.liveBridge;
+  if (!bridge?.enabled) throw new Error("Live bridge not enabled");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), bridge.timeoutMs ?? 600000);
+
+  try {
+    const response = await fetch(`${bridge.url.replace(/\/$/, "")}/stream-prompt`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${bridge.token}`,
+      },
+      body: JSON.stringify({ message }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error(`Live bridge stream failed with ${response.status}`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalText = "";
+
+    for await (const chunk of response.body as any) {
+      buffer += decoder.decode(chunk, { stream: true });
+      while (true) {
+        const newlineIndex = buffer.indexOf("\n");
+        if (newlineIndex === -1) break;
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!line) continue;
+        const event = JSON.parse(line) as { type?: string; text?: string; error?: string; toolName?: string };
+        await onEvent(event);
+        if (event.type === "final") {
+          finalText = event.text?.trim() || "";
+        }
+        if (event.type === "error") {
+          throw new Error(event.error || "Live bridge stream error");
+        }
+      }
+    }
+
+    return finalText;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function deliverPromptResult(session: SessionConfig | undefined, msg: any): Promise<void> {
+  if (!session) return;
+
+  try {
+    let text = extractAssistantText(msg);
+
+    if (!text) {
+      text = extractLastAssistantTextFromMessages(msg?.messages);
+    }
+
+    if (!text && rpcProcess) {
+      try {
+        const last = await sendRpc("get_last_assistant_text") as { success?: boolean; data?: { text?: string } };
+        text = last?.data?.text?.trim() || "";
+      } catch (err) {
+        console.error("[gateway] Failed to fetch last assistant text:", err);
+      }
+    }
+
+    if (!text) {
+      console.warn(`[gateway] No assistant text to deliver for ${session.platform}:${session.channelId}`);
+      return;
+    }
+
+    const adapter = adapters.get(session.platform);
+    if (!adapter) return;
+
+    try {
+      console.log(`[gateway] Delivering response to ${session.platform}:${session.channelId}`);
+      await adapter.sendMessage(session.channelId, text);
+    } catch (err) {
+      console.error(`[gateway] Failed to deliver response to ${session.platform}:${session.channelId}:`, err);
+    }
+  } finally {
+    await updateTyping(session, -1);
   }
 }
 
@@ -229,8 +450,20 @@ function createRpcProcess(): any {
     env: { ...process.env, OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434" },
   });
 
+  let stdoutBuffer = "";
+
   proc.stdout?.on("data", (data: Buffer) => {
-    for (const line of data.toString().split("\n").filter(Boolean)) {
+    stdoutBuffer += data.toString();
+
+    while (true) {
+      const newlineIndex = stdoutBuffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+
+      let line = stdoutBuffer.slice(0, newlineIndex);
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (!line.trim()) continue;
+
       try {
         const msg = JSON.parse(line);
         if (msg.id) {
@@ -242,12 +475,21 @@ function createRpcProcess(): any {
         if (msg.type === "response") broadcastClients("response", msg);
         else broadcastClients("event", msg);
 
-        if (msg.type === "turn_end") {
+        if (msg.type === "message_end" && isFinalAssistantMessage(msg) && pendingPromptSessions.length > 0) {
           const session = pendingPromptSessions.shift();
-          console.log(`[gateway] Received turn_end; pending sessions left: ${pendingPromptSessions.length}`);
+          console.log(`[gateway] Received final assistant message; pending sessions left: ${pendingPromptSessions.length}`);
+          void deliverPromptResult(session, msg);
+          continue;
+        }
+
+        if (msg.type === "agent_end" && pendingPromptSessions.length > 0) {
+          const session = pendingPromptSessions.shift();
+          console.log(`[gateway] Received agent_end; pending sessions left: ${pendingPromptSessions.length}`);
           void deliverPromptResult(session, msg);
         }
-      } catch { /* not JSON */ }
+      } catch (err) {
+        console.error("[gateway] Failed to parse pi stdout JSONL record:", err);
+      }
     }
   });
 
@@ -306,18 +548,42 @@ async function sendRpc(command: string, data: Record<string, unknown> = {}): Pro
   });
 }
 
+function escapeTelegramHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function renderTelegramTurnStatus(state: {
+  toolName?: string;
+  toolFinished?: boolean;
+  preview?: string;
+  phase: "thinking" | "tool" | "finalizing" | "done";
+}): string {
+  const thinking = state.phase === "thinking" ? "🔄" : "✅";
+  const tool = state.phase === "tool" ? "🔄" : (state.toolName ? (state.toolFinished ? "✅" : "🔄") : "⬜");
+  const finalizing = state.phase === "finalizing" ? "🔄" : state.phase === "done" ? "✅" : "⬜";
+
+  const lines = [
+    "✨ <b>Turn status</b>",
+    "",
+    `✅ Received request`,
+    `${thinking} Thinking`,
+    `${tool} Tool call${state.toolName ? `: <b>${escapeTelegramHtml(state.toolName)}</b>` : ""}`,
+    `${finalizing} Final response`,
+  ];
+
+  if (state.preview) {
+    lines.push("", "💬 <b>Preview</b>", escapeTelegramHtml(state.preview));
+  }
+
+  return lines.join("\n");
+}
+
 const adapterCallbacks: AdapterCallbacks = {
   onMessage: async (message: PlatformMessage) => {
-    const session = await getOrCreateSession(
-      message.platform,
-      message.channelId,
-      message.userId,
-      {
-        resetPolicy: config.sessions.resetPolicy,
-        dailyHour: config.sessions.dailyHour,
-        idleMinutes: config.sessions.idleMinutes,
-      }
-    );
+    const session = await resolveInboundSession(message);
 
     if (!(await isUserAllowed(message.platform as Platform, message.userId))) {
       console.log(`[gateway] User ${message.userId} not in allowlist`);
@@ -326,11 +592,133 @@ const adapterCallbacks: AdapterCallbacks = {
 
     sessions.set(`${message.platform}:${message.channelId}`, session);
 
+    if (config.liveBridge?.enabled) {
+      await updateTyping(session, 1);
+      try {
+        console.log(`[gateway] Forwarding ${message.platform} message from ${message.userId} in ${message.channelId} to live bridge`);
+        const adapter = adapters.get(session.platform);
+        const telegramMode = config.liveBridge.telegramMode ?? "clean";
+        let statusMessageId: string | undefined;
+        let lastRenderedText = "";
+        let lastRenderAt = 0;
+        const turnState: {
+          toolName?: string;
+          toolFinished?: boolean;
+          preview?: string;
+          phase: "thinking" | "tool" | "finalizing" | "done";
+        } = { phase: "thinking" };
+
+        const buildStatusText = (): string => renderTelegramTurnStatus(turnState);
+
+        const ensureStatusMessage = async (): Promise<void> => {
+          if (!adapter || session.platform !== "telegram" || statusMessageId) return;
+          try {
+            const text = buildStatusText();
+            statusMessageId = await adapter.sendMessage(session.channelId, text);
+            lastRenderedText = text;
+            lastRenderAt = Date.now();
+          } catch (err) {
+            console.warn(`[gateway] Failed to create Telegram status message for ${session.id}:`, err);
+          }
+        };
+
+        const maybeRenderStatus = async (force = false): Promise<void> => {
+          if (!adapter || session.platform !== "telegram") return;
+          await ensureStatusMessage();
+          if (!statusMessageId) return;
+          const text = buildStatusText();
+          const now = Date.now();
+          if (!force) {
+            if (text === lastRenderedText) return;
+            if (now - lastRenderAt < 1200) return;
+          }
+          try {
+            await adapter.editMessage(session.channelId, statusMessageId, text);
+            lastRenderedText = text;
+            lastRenderAt = now;
+          } catch (err) {
+            console.warn(`[gateway] Failed to edit Telegram status message for ${session.id}:`, err);
+            statusMessageId = undefined;
+          }
+        };
+
+        await ensureStatusMessage();
+
+        const text = await promptViaLiveBridgeStream(message.content, async (event) => {
+          if (!adapter || session.platform !== "telegram") return;
+          if (event.type === "status" && event.text) {
+            const statusText = event.text.toLowerCase();
+            if (statusText.includes("running") && event.toolName) {
+              turnState.phase = "tool";
+              turnState.toolName = event.toolName;
+              turnState.toolFinished = false;
+            } else if (statusText.includes("finished") && event.toolName) {
+              turnState.phase = "finalizing";
+              turnState.toolName = event.toolName;
+              turnState.toolFinished = true;
+            } else if (statusText.includes("working") || statusText.includes("thinking")) {
+              turnState.phase = "thinking";
+            }
+            await maybeRenderStatus();
+            return;
+          }
+          if (event.type === "assistant_partial" && event.text) {
+            const partial = event.text.trim();
+            if (!partial) return;
+            turnState.phase = "finalizing";
+            turnState.preview = partial.length > 900 ? `${partial.slice(0, 900).trimEnd()}…` : partial;
+            await maybeRenderStatus();
+            return;
+          }
+          if (event.type === "assistant" && event.text && telegramMode === "clean") {
+            const complete = event.text.trim();
+            if (!complete) return;
+            turnState.phase = "done";
+            turnState.preview = complete.length > 900 ? `${complete.slice(0, 900).trimEnd()}…` : complete;
+            await maybeRenderStatus(true);
+          }
+        });
+
+        if (adapter && text) {
+          if (session.platform === "telegram") {
+            await ensureStatusMessage();
+            if (statusMessageId) {
+              if (telegramMode === "clean") {
+                try {
+                  await adapter.deleteMessage(session.channelId, statusMessageId);
+                } catch {
+                  // ignore delete failure; final answer still goes out cleanly
+                }
+                await adapter.sendMessage(session.channelId, text);
+              } else {
+                try {
+                  await maybeRenderStatus(true);
+                } catch {
+                  // ignore status edit failure in persistent mode
+                }
+                await adapter.sendMessage(session.channelId, text);
+              }
+            } else {
+              await adapter.sendMessage(session.channelId, text);
+            }
+          } else {
+            await adapter.sendMessage(session.channelId, text);
+          }
+        }
+      } catch (err) {
+        console.error(`[gateway] Live bridge prompt failed for ${session.id}:`, err);
+      } finally {
+        await updateTyping(session, -1);
+      }
+      return;
+    }
+
     if (rpcProcess) {
       console.log(`[gateway] Forwarding ${message.platform} message from ${message.userId} in ${message.channelId} to pi session ${session.id}`);
       const result = await sendRpc("prompt", { message: message.content, sessionId: session.id }) as { success?: boolean; error?: string };
       if (result?.success) {
         pendingPromptSessions.push(session);
+        await updateTyping(session, 1);
         console.log(`[gateway] Prompt accepted for ${session.id}; pending sessions: ${pendingPromptSessions.length}`);
       } else {
         console.error(`[gateway] Prompt rejected for ${session.id}: ${result?.error || "unknown error"}`);
@@ -534,8 +922,22 @@ function handleWebSocket(ws: WebSocket, req: IncomingMessage): void {
       const msg = JSON.parse(data.toString());
       switch (msg.type) {
         case "prompt": {
-          const result = await sendRpc("prompt", { message: msg.data?.message || "" });
-          sendWs(ws, { type: "response", id: msg.id, data: result });
+          const message = msg.data?.message || "";
+          const sessionId = typeof msg.data?.sessionId === "string" && msg.data.sessionId.trim()
+            ? msg.data.sessionId.trim()
+            : undefined;
+          const result = await sendRpc("prompt", {
+            message,
+            ...(sessionId ? { sessionId } : {}),
+          });
+          sendWs(ws, {
+            type: "response",
+            id: msg.id,
+            data: {
+              ...(typeof result === "object" && result !== null ? result as Record<string, unknown> : { result }),
+              ...(sessionId ? { sessionId } : {}),
+            },
+          });
           break;
         }
         case "background": {
@@ -731,6 +1133,15 @@ export function getStatus(): GatewayStatus {
  * Get the current gateway config.
  */
 export function getConfig(): GatewayConfig {
+  return config;
+}
+
+/**
+ * Update gateway config and persist it.
+ */
+export function setConfig(nextConfig: GatewayConfig): GatewayConfig {
+  config = nextConfig;
+  saveConfig();
   return config;
 }
 

@@ -50,6 +50,9 @@ import { TelegramAdapter } from "./adapters/telegram.js";
 import { SlackAdapter } from "./adapters/slack.js";
 import { WhatsAppAdapter } from "./adapters/whatsapp.js";
 import { BaseAdapter, type AdapterCallbacks, type PlatformMessage } from "./adapters/base.js";
+import { TelegramSendQueue } from "./telegram/send-queue.js";
+import { TelegramStreamAdapter } from "./telegram/tg-adapter.js";
+import { TelegramStreamDispatcher } from "./telegram/stream-dispatcher.js";
 
 const KOBOLD_DIR = join(homedir(), ".0xkobold");
 const CONFIG_DIR = join(KOBOLD_DIR, "gateway");
@@ -60,6 +63,8 @@ const LIVE_BRIDGE_CONFIG_FILE = join(homedir(), ".pi", "agent", "live-session-br
 // ═════════════════════════════════════════════════════════════════════════════
 // Types
 // ═════════════════════════════════════════════════════════════════════════════
+
+type TelegramMode = "clean" | "balanced" | "full" | "persistent";
 
 export interface GatewayConfig {
   port: number;
@@ -83,7 +88,8 @@ export interface GatewayConfig {
     url: string;
     token: string;
     timeoutMs?: number;
-    telegramMode?: "clean" | "persistent";
+    telegramMode?: TelegramMode;
+    telegramModesByChat?: Record<string, TelegramMode>;
     autoDiscover?: boolean;
   };
   platforms: {
@@ -125,7 +131,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
   enableHttp: true,
   security: { allowAll: true, requirePairing: false },
   sessions: { resetPolicy: "idle", dailyHour: 4, idleMinutes: 1440, bindings: {} },
-  liveBridge: { enabled: false, url: "http://127.0.0.1:8766", token: "", timeoutMs: 600000, telegramMode: "clean", autoDiscover: true },
+  liveBridge: { enabled: false, url: "http://127.0.0.1:8766", token: "", timeoutMs: 600000, telegramMode: "balanced", telegramModesByChat: {}, autoDiscover: true },
   platforms: {},
 };
 
@@ -149,6 +155,30 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 const pendingRequests: PendingRequest[] = [];
+
+type ClientSessionMode = "canonical" | "isolated";
+
+type ClientEventKind = "assistant" | "thinking" | "tool" | "error" | "status" | "final";
+
+type ClientStreamEvent = {
+  eventId: string;
+  turnId: string;
+  sessionId: string;
+  kind: ClientEventKind;
+  timestamp: string;
+  payload: Record<string, unknown>;
+};
+
+type ClientTurnState = {
+  id: string;
+  sessionId: string;
+  events: ClientStreamEvent[];
+  subscribers: Set<ServerResponse>;
+  completed: boolean;
+};
+
+const clientTurns = new Map<string, ClientTurnState>();
+const telegramSendQueue = new TelegramSendQueue();
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Internal helpers
@@ -219,6 +249,20 @@ function broadcastClients(event: string, data: unknown): void {
   for (const ws of clients.values()) {
     sendWs(ws, { type: event, data });
   }
+}
+
+function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
 function extractAssistantTextFromMessage(message: any): string {
@@ -353,7 +397,7 @@ async function promptViaLiveBridge(message: string): Promise<string> {
 
 async function promptViaLiveBridgeStream(
   message: string,
-  onEvent: (event: { type?: string; text?: string; error?: string; toolName?: string }) => Promise<void> | void,
+  onEvent: (event: BridgeStreamEvent) => Promise<void> | void,
 ): Promise<string> {
   config = syncLiveBridgeConfigFromFile(config);
   const bridge = config.liveBridge;
@@ -389,10 +433,12 @@ async function promptViaLiveBridgeStream(
         const line = buffer.slice(0, newlineIndex).trim();
         buffer = buffer.slice(newlineIndex + 1);
         if (!line) continue;
-        const event = JSON.parse(line) as { type?: string; text?: string; error?: string; toolName?: string };
+        const event = JSON.parse(line) as BridgeStreamEvent;
         await onEvent(event);
         if (event.type === "final") {
           finalText = event.text?.trim() || "";
+          controller.abort();
+          return finalText;
         }
         if (event.type === "error") {
           throw new Error(event.error || "Live bridge stream error");
@@ -555,30 +601,190 @@ function escapeTelegramHtml(text: string): string {
     .replaceAll(">", "&gt;");
 }
 
-function renderTelegramTurnStatus(state: {
+function normalizeTelegramMode(mode?: TelegramMode): "clean" | "balanced" | "full" {
+  if (mode === "persistent") return "full";
+  if (mode === "clean" || mode === "full") return mode;
+  return "balanced";
+}
+
+function getTelegramModeForSession(session: SessionConfig): "clean" | "balanced" | "full" {
+  const bridge = config.liveBridge;
+  const key = `${session.platform}:${session.channelId}`;
+  const scopedMode = bridge?.telegramModesByChat?.[key];
+  return normalizeTelegramMode(scopedMode ?? bridge?.telegramMode);
+}
+
+type BridgeStreamEvent = { type?: string; text?: string; error?: string; toolName?: string; isError?: boolean; phase?: "start" | "end" };
+
+type ChatSurfaceEvent = {
+  kind: "assistant_message" | "thinking" | "tool_call" | "failure" | "completion";
+  tier: 1 | 2 | 3;
+  phase?: "partial" | "final" | "start" | "end";
+  summary: string;
   toolName?: string;
-  toolFinished?: boolean;
-  preview?: string;
-  phase: "thinking" | "tool" | "finalizing" | "done";
-}): string {
-  const thinking = state.phase === "thinking" ? "🔄" : "✅";
-  const tool = state.phase === "tool" ? "🔄" : (state.toolName ? (state.toolFinished ? "✅" : "🔄") : "⬜");
-  const finalizing = state.phase === "finalizing" ? "🔄" : state.phase === "done" ? "✅" : "⬜";
+  isError?: boolean;
+};
 
-  const lines = [
-    "✨ <b>Turn status</b>",
-    "",
-    `✅ Received request`,
-    `${thinking} Thinking`,
-    `${tool} Tool call${state.toolName ? `: <b>${escapeTelegramHtml(state.toolName)}</b>` : ""}`,
-    `${finalizing} Final response`,
-  ];
+function normalizeBridgeStreamEvent(event: BridgeStreamEvent): ChatSurfaceEvent | null {
+  if (event.type === "assistant_partial" && event.text?.trim()) {
+    return { kind: "assistant_message", tier: 1, phase: "partial", summary: event.text.trim() };
+  }
+  if ((event.type === "assistant" || event.type === "final") && event.text?.trim()) {
+    return { kind: "assistant_message", tier: 1, phase: "final", summary: event.text.trim() };
+  }
+  if (event.type === "thinking" && event.text?.trim()) {
+    return { kind: "thinking", tier: 2, summary: event.text.trim() };
+  }
+  if (event.type === "error") {
+    return { kind: "failure", tier: 1, summary: event.error?.trim() || "Live bridge stream error" };
+  }
+  if (event.type === "status" && event.text) {
+    const statusText = event.text.trim();
+    if (event.toolName) {
+      return {
+        kind: "tool_call",
+        tier: event.isError ? 1 : 2,
+        phase: event.phase === "end" ? "end" : "start",
+        summary: statusText,
+        toolName: event.toolName,
+        isError: event.isError,
+      };
+    }
+    return null;
+  }
+  return null;
+}
 
-  if (state.preview) {
-    lines.push("", "💬 <b>Preview</b>", escapeTelegramHtml(state.preview));
+function publishClientTurnEvent(turn: ClientTurnState, event: ClientStreamEvent): void {
+  turn.events.push(event);
+  const payload = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const res of turn.subscribers) {
+    try {
+      res.write(payload);
+    } catch {
+      turn.subscribers.delete(res);
+    }
+  }
+}
+
+function completeClientTurn(turn: ClientTurnState): void {
+  turn.completed = true;
+  for (const res of turn.subscribers) {
+    try {
+      res.end();
+    } catch {
+      // ignore subscriber close failures
+    }
+  }
+  turn.subscribers.clear();
+  setTimeout(() => {
+    clientTurns.delete(turn.id);
+  }, 10 * 60 * 1000).unref?.();
+}
+
+function createClientEvent(
+  turn: ClientTurnState,
+  kind: ClientEventKind,
+  payload: Record<string, unknown>,
+): ClientStreamEvent {
+  return {
+    eventId: `evt_${randomBytes(6).toString("hex")}`,
+    turnId: turn.id,
+    sessionId: turn.sessionId,
+    kind,
+    timestamp: new Date().toISOString(),
+    payload,
+  };
+}
+
+async function resolveClientSession(body: any): Promise<SessionConfig> {
+  const requestedSessionId = typeof body?.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : undefined;
+  if (requestedSessionId) {
+    const existing = await getSession(requestedSessionId);
+    if (existing) {
+      await touchSession(existing.id);
+      return existing;
+    }
   }
 
-  return lines.join("\n");
+  const sessionMode: ClientSessionMode = body?.sessionMode === "isolated" ? "isolated" : "canonical";
+  const clientKind = typeof body?.clientKind === "string" && body.clientKind.trim() ? body.clientKind.trim() : "mobile";
+  const surfaceId = typeof body?.surfaceId === "string" && body.surfaceId.trim() ? body.surfaceId.trim() : `${clientKind}-client`;
+  const userId = typeof body?.userId === "string" && body.userId.trim() ? body.userId.trim() : surfaceId;
+  const channelId = sessionMode === "canonical"
+    ? "canonical"
+    : `isolated:${surfaceId}:${randomBytes(6).toString("hex")}`;
+
+  return getOrCreateSession("client", channelId, userId, {
+    resetPolicy: config.sessions.resetPolicy,
+    dailyHour: config.sessions.dailyHour,
+    idleMinutes: config.sessions.idleMinutes,
+  });
+}
+
+function startClientTurn(turn: ClientTurnState, message: string): void {
+  const assistantMessageId = `assistant_${turn.id}`;
+  void (async () => {
+    try {
+      let latestAssistantText = "";
+      const streamedFinalText = await promptViaLiveBridgeStream(message, async (bridgeEvent) => {
+        if (bridgeEvent.type === "assistant_partial" && bridgeEvent.text?.trim()) {
+          latestAssistantText += bridgeEvent.text;
+          return;
+        }
+
+        if (bridgeEvent.type === "thinking" && bridgeEvent.text?.trim()) {
+          publishClientTurnEvent(turn, createClientEvent(turn, "thinking", {
+            messageId: `thinking_${randomBytes(4).toString("hex")}`,
+            text: bridgeEvent.text.trim(),
+            final: true,
+          }));
+          return;
+        }
+
+        if (bridgeEvent.type === "status" && bridgeEvent.toolName && bridgeEvent.text?.trim()) {
+          publishClientTurnEvent(turn, createClientEvent(turn, "tool", {
+            messageId: `tool_${randomBytes(4).toString("hex")}`,
+            toolName: bridgeEvent.toolName,
+            phase: bridgeEvent.phase === "end" ? "end" : "start",
+            summary: bridgeEvent.text.trim(),
+            important: !!bridgeEvent.isError,
+            error: bridgeEvent.isError ? bridgeEvent.text.trim() : null,
+          }));
+          return;
+        }
+
+        if (bridgeEvent.type === "error") {
+          publishClientTurnEvent(turn, createClientEvent(turn, "error", {
+            messageId: `error_${randomBytes(4).toString("hex")}`,
+            text: bridgeEvent.error?.trim() || "Live bridge stream error",
+            scope: "bridge",
+            retrying: false,
+            fatal: false,
+          }));
+        }
+      });
+
+      const finalText = streamedFinalText || latestAssistantText;
+
+      publishClientTurnEvent(turn, createClientEvent(turn, "final", {
+        messageId: assistantMessageId,
+        text: finalText,
+        markdown: true,
+        finishReason: "completed",
+      }));
+    } catch (err) {
+      publishClientTurnEvent(turn, createClientEvent(turn, "error", {
+        messageId: `error_${randomBytes(4).toString("hex")}`,
+        text: err instanceof Error ? err.message : String(err),
+        scope: "turn",
+        retrying: false,
+        fatal: false,
+      }));
+    } finally {
+      completeClientTurn(turn);
+    }
+  })();
 }
 
 const adapterCallbacks: AdapterCallbacks = {
@@ -597,111 +803,27 @@ const adapterCallbacks: AdapterCallbacks = {
       try {
         console.log(`[gateway] Forwarding ${message.platform} message from ${message.userId} in ${message.channelId} to live bridge`);
         const adapter = adapters.get(session.platform);
-        const telegramMode = config.liveBridge.telegramMode ?? "clean";
-        let statusMessageId: string | undefined;
-        let lastRenderedText = "";
-        let lastRenderAt = 0;
-        const turnState: {
-          toolName?: string;
-          toolFinished?: boolean;
-          preview?: string;
-          phase: "thinking" | "tool" | "finalizing" | "done";
-        } = { phase: "thinking" };
 
-        const buildStatusText = (): string => renderTelegramTurnStatus(turnState);
+        if (session.platform === "telegram" && adapter instanceof TelegramAdapter) {
+          const dispatcher = new TelegramStreamDispatcher(
+            session.channelId,
+            new TelegramStreamAdapter(adapter, telegramSendQueue),
+          );
 
-        const ensureStatusMessage = async (): Promise<void> => {
-          if (!adapter || session.platform !== "telegram" || statusMessageId) return;
-          try {
-            const text = buildStatusText();
-            statusMessageId = await adapter.sendMessage(session.channelId, text);
-            lastRenderedText = text;
-            lastRenderAt = Date.now();
-          } catch (err) {
-            console.warn(`[gateway] Failed to create Telegram status message for ${session.id}:`, err);
-          }
-        };
-
-        const maybeRenderStatus = async (force = false): Promise<void> => {
-          if (!adapter || session.platform !== "telegram") return;
-          await ensureStatusMessage();
-          if (!statusMessageId) return;
-          const text = buildStatusText();
-          const now = Date.now();
-          if (!force) {
-            if (text === lastRenderedText) return;
-            if (now - lastRenderAt < 1200) return;
-          }
-          try {
-            await adapter.editMessage(session.channelId, statusMessageId, text);
-            lastRenderedText = text;
-            lastRenderAt = now;
-          } catch (err) {
-            console.warn(`[gateway] Failed to edit Telegram status message for ${session.id}:`, err);
-            statusMessageId = undefined;
-          }
-        };
-
-        await ensureStatusMessage();
-
-        const text = await promptViaLiveBridgeStream(message.content, async (event) => {
-          if (!adapter || session.platform !== "telegram") return;
-          if (event.type === "status" && event.text) {
-            const statusText = event.text.toLowerCase();
-            if (statusText.includes("running") && event.toolName) {
-              turnState.phase = "tool";
-              turnState.toolName = event.toolName;
-              turnState.toolFinished = false;
-            } else if (statusText.includes("finished") && event.toolName) {
-              turnState.phase = "finalizing";
-              turnState.toolName = event.toolName;
-              turnState.toolFinished = true;
-            } else if (statusText.includes("working") || statusText.includes("thinking")) {
-              turnState.phase = "thinking";
+          await promptViaLiveBridgeStream(message.content, async (event) => {
+            const result = await dispatcher.onBridgeEvent(event);
+            if (!result.ok) {
+              console.warn(`[gateway] Telegram stream dispatch failed for ${session.id}: ${result.error}`);
             }
-            await maybeRenderStatus();
-            return;
-          }
-          if (event.type === "assistant_partial" && event.text) {
-            const partial = event.text.trim();
-            if (!partial) return;
-            turnState.phase = "finalizing";
-            turnState.preview = partial.length > 900 ? `${partial.slice(0, 900).trimEnd()}…` : partial;
-            await maybeRenderStatus();
-            return;
-          }
-          if (event.type === "assistant" && event.text && telegramMode === "clean") {
-            const complete = event.text.trim();
-            if (!complete) return;
-            turnState.phase = "done";
-            turnState.preview = complete.length > 900 ? `${complete.slice(0, 900).trimEnd()}…` : complete;
-            await maybeRenderStatus(true);
-          }
-        });
+          });
 
-        if (adapter && text) {
-          if (session.platform === "telegram") {
-            await ensureStatusMessage();
-            if (statusMessageId) {
-              if (telegramMode === "clean") {
-                try {
-                  await adapter.deleteMessage(session.channelId, statusMessageId);
-                } catch {
-                  // ignore delete failure; final answer still goes out cleanly
-                }
-                await adapter.sendMessage(session.channelId, text);
-              } else {
-                try {
-                  await maybeRenderStatus(true);
-                } catch {
-                  // ignore status edit failure in persistent mode
-                }
-                await adapter.sendMessage(session.channelId, text);
-              }
-            } else {
-              await adapter.sendMessage(session.channelId, text);
-            }
-          } else {
+          const flushResult = await dispatcher.streamEnd();
+          if (!flushResult.ok) {
+            console.warn(`[gateway] Telegram stream flush failed for ${session.id}: ${flushResult.error}`);
+          }
+        } else {
+          const text = await promptViaLiveBridgeStream(message.content, async () => {});
+          if (adapter && text) {
             await adapter.sendMessage(session.channelId, text);
           }
         }
@@ -867,20 +989,116 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
 
   if (url.pathname === "/api/status" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    writeJson(res, 200, {
       running,
       adapters: Array.from(adapters.keys()),
       clients: clients.size,
       sessions: sessions.size,
       agent: rpcProcess !== null,
-    }));
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/client/sessions/resolve" && req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      const session = await resolveClientSession(body);
+      writeJson(res, 200, {
+        ok: true,
+        session: {
+          id: session.id,
+          mode: session.channelId === "canonical" ? "canonical" : "isolated",
+          title: "Vela",
+          created: !body?.sessionId,
+        },
+      });
+    } catch (err) {
+      writeJson(res, 400, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/client/turns" && req.method === "POST") {
+    try {
+      if (!config.liveBridge?.enabled) {
+        writeJson(res, 503, { ok: false, error: "Live bridge is not enabled" });
+        return;
+      }
+      const body = await readJsonBody(req);
+      const sessionId = typeof body?.sessionId === "string" ? body.sessionId.trim() : "";
+      const inputText = typeof body?.input?.text === "string" ? body.input.text.trim() : "";
+      if (!sessionId || !inputText) {
+        writeJson(res, 400, { ok: false, error: "sessionId and input.text are required" });
+        return;
+      }
+      const session = await getSession(sessionId);
+      if (!session) {
+        writeJson(res, 404, { ok: false, error: `Unknown session: ${sessionId}` });
+        return;
+      }
+      await touchSession(session.id);
+      const turnId = `turn_${randomBytes(6).toString("hex")}`;
+      const turn: ClientTurnState = {
+        id: turnId,
+        sessionId: session.id,
+        events: [],
+        subscribers: new Set(),
+        completed: false,
+      };
+      clientTurns.set(turn.id, turn);
+      startClientTurn(turn, inputText);
+      writeJson(res, 200, {
+        ok: true,
+        turn: {
+          id: turn.id,
+          sessionId: turn.sessionId,
+          streamUrl: `/api/client/turns/${turn.id}/stream`,
+        },
+      });
+    } catch (err) {
+      writeJson(res, 400, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  const clientTurnMatch = url.pathname.match(/^\/api\/client\/turns\/([^/]+)\/stream$/);
+  if (clientTurnMatch && req.method === "GET") {
+    const turn = clientTurns.get(clientTurnMatch[1]);
+    if (!turn) {
+      writeJson(res, 404, { ok: false, error: "Turn not found" });
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+
+    for (const event of turn.events) {
+      res.write(`event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+
+    if (turn.completed) {
+      res.end();
+      return;
+    }
+
+    turn.subscribers.add(res);
+    req.on("close", () => {
+      turn.subscribers.delete(res);
+    });
     return;
   }
 
   if (url.pathname === "/api/sessions" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(await listSessions()));
+    writeJson(res, 200, await listSessions());
     return;
   }
 

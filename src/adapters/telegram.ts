@@ -57,6 +57,7 @@ export class TelegramAdapter extends BaseAdapter {
   private offset = 0;
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private connected = false;
+  private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(config: TelegramConfig) {
     super();
@@ -253,10 +254,36 @@ export class TelegramAdapter extends BaseAdapter {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
     }
+    for (const interval of this.typingIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.typingIntervals.clear();
     await super.stop();
   }
 
-  async sendMessage(channelId: string, content: string): Promise<string> {
+  private splitMessage(content: string, maxLength = 3500): string[] {
+    const text = content.trim();
+    if (!text) return [""];
+    if (text.length <= maxLength) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > maxLength) {
+      let splitAt = remaining.lastIndexOf("\n\n", maxLength);
+      if (splitAt < maxLength * 0.5) splitAt = remaining.lastIndexOf("\n", maxLength);
+      if (splitAt < maxLength * 0.5) splitAt = remaining.lastIndexOf(" ", maxLength);
+      if (splitAt < maxLength * 0.5) splitAt = maxLength;
+
+      chunks.push(remaining.slice(0, splitAt).trim());
+      remaining = remaining.slice(splitAt).trim();
+    }
+
+    if (remaining) chunks.push(remaining);
+    return chunks.filter(Boolean);
+  }
+
+  private async sendSingleMessage(channelId: string, content: string): Promise<string> {
     let response = await this.apiRequest("/sendMessage", {
       method: "POST",
       body: JSON.stringify({
@@ -281,10 +308,21 @@ export class TelegramAdapter extends BaseAdapter {
     }
 
     if (!data.ok) {
-      throw new Error(`Failed to send message: ${data.description || "unknown error"}`);
+      throw new Error(`Failed to send message (${response.status}): ${data.description || "unknown error"}`);
     }
 
     return String(data.result?.message_id || 0);
+  }
+
+  async sendMessage(channelId: string, content: string): Promise<string> {
+    const chunks = this.splitMessage(content);
+    let lastMessageId = "0";
+
+    for (const chunk of chunks) {
+      lastMessageId = await this.sendSingleMessage(channelId, chunk);
+    }
+
+    return lastMessageId;
   }
 
   async sendPhoto(channelId: string, photoUrl: string, caption?: string): Promise<string> {
@@ -334,7 +372,7 @@ export class TelegramAdapter extends BaseAdapter {
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
-    await this.apiRequest("/editMessageText", {
+    let response = await this.apiRequest("/editMessageText", {
       method: "POST",
       body: JSON.stringify({
         chat_id: channelId,
@@ -343,6 +381,25 @@ export class TelegramAdapter extends BaseAdapter {
         parse_mode: "HTML",
       }),
     });
+
+    let data = await response.json() as { ok?: boolean; description?: string };
+
+    if (!data.ok) {
+      console.warn(`[Telegram] HTML edit failed, retrying as plain text: ${data.description || "unknown error"}`);
+      response = await this.apiRequest("/editMessageText", {
+        method: "POST",
+        body: JSON.stringify({
+          chat_id: channelId,
+          message_id: parseInt(messageId),
+          text: content,
+        }),
+      });
+      data = await response.json() as { ok?: boolean; description?: string };
+    }
+
+    if (!data.ok) {
+      throw new Error(`Failed to edit message (${response.status}): ${data.description || "unknown error"}`);
+    }
   }
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
@@ -355,15 +412,43 @@ export class TelegramAdapter extends BaseAdapter {
     });
   }
 
-  async setTyping(channelId: string, isTyping: boolean): Promise<void> {
-    const action = isTyping ? "typing" : "cancel";
-    await this.apiRequest("/sendChatAction", {
+  private async sendTypingAction(channelId: string): Promise<void> {
+    const response = await this.apiRequest("/sendChatAction", {
       method: "POST",
       body: JSON.stringify({
         chat_id: channelId,
-        action,
+        action: "typing",
       }),
     });
+
+    const data = await response.json() as { ok?: boolean; description?: string };
+    if (!response.ok || !data?.ok) {
+      throw new Error(`Failed to send typing action: ${data?.description || response.statusText || response.status}`);
+    }
+  }
+
+  async setTyping(channelId: string, isTyping: boolean): Promise<void> {
+    const existing = this.typingIntervals.get(channelId);
+
+    if (!isTyping) {
+      if (existing) {
+        clearInterval(existing);
+        this.typingIntervals.delete(channelId);
+      }
+      return;
+    }
+
+    if (existing) return;
+
+    await this.sendTypingAction(channelId);
+
+    const interval = setInterval(() => {
+      void this.sendTypingAction(channelId).catch(err => {
+        console.error(`[Telegram] Failed to refresh typing for ${channelId}:`, err);
+      });
+    }, 4000);
+
+    this.typingIntervals.set(channelId, interval);
   }
 
   async getStatus(): Promise<{ connected: boolean; latency?: number }> {

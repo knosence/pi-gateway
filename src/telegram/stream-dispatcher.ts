@@ -1,5 +1,5 @@
 import { TelegramStreamAdapter } from "./tg-adapter.js";
-import { err, ok, type Result, type TelegramBlockKind, type TelegramBlockMeta, type TelegramBlockState } from "./block-state.js";
+import { err, isErr, ok, type Result, type TelegramBlockKind, type TelegramBlockMeta, type TelegramBlockState } from "./block-state.js";
 
 export type BridgeStreamEvent = {
   type?: string;
@@ -73,9 +73,9 @@ export class TelegramStreamDispatcher {
   async streamEnd(): Promise<Result<void, string>> {
     if (this.activeTextBlockIndex != null) {
       const finalizeResult = await this.syncActiveBlockToLatestAssistant();
-      if (!finalizeResult.ok) return finalizeResult;
+      if (isErr(finalizeResult)) return err(finalizeResult.error);
       const closeResult = await this.closeBlock(this.activeTextBlockIndex);
-      if (!closeResult.ok) return closeResult;
+      if (isErr(closeResult)) return err(closeResult.error);
       const block = this.blocks.get(this.activeTextBlockIndex);
       if (block) this.lastClosedText = block.buffer;
       this.activeTextBlockIndex = null;
@@ -85,7 +85,7 @@ export class TelegramStreamDispatcher {
 
   private async appendTextDelta(chunk: string): Promise<Result<void, string>> {
     const upsertResult = await this.upsertTextBuffer(chunk, true);
-    if (!upsertResult.ok) return upsertResult;
+    if (isErr(upsertResult)) return err(upsertResult.error);
 
     const block = this.blocks.get(upsertResult.value);
     if (!block) return err(`Missing text block ${upsertResult.value}`);
@@ -94,34 +94,34 @@ export class TelegramStreamDispatcher {
     if (now - block.lastEditAt < 800) return ok(undefined);
 
     const flushResult = await this.transport.flushBlock(this.chatId, block, false);
-    if (!flushResult.ok) return flushResult;
+    if (isErr(flushResult)) return err(flushResult.error);
     this.blocks.set(block.index, flushResult.value);
     return ok(undefined);
   }
 
   private async absorbTerminalAssistant(text: string): Promise<Result<void, string>> {
     const upsertResult = await this.upsertTextBuffer(text, false);
-    if (!upsertResult.ok) return upsertResult;
+    if (isErr(upsertResult)) return err(upsertResult.error);
 
     const block = this.blocks.get(upsertResult.value);
     if (!block) return err(`Missing assistant text block ${upsertResult.value}`);
 
     const flushResult = await this.transport.flushBlock(this.chatId, block, false);
-    if (!flushResult.ok) return flushResult;
+    if (isErr(flushResult)) return err(flushResult.error);
     this.blocks.set(block.index, flushResult.value);
     return ok(undefined);
   }
 
   private async finalizeText(finalText: string): Promise<Result<void, string>> {
     const upsertResult = await this.upsertTextBuffer(finalText, false);
-    if (!upsertResult.ok) return upsertResult;
+    if (isErr(upsertResult)) return err(upsertResult.error);
     const index = upsertResult.value;
 
     const block = this.blocks.get(index);
     if (!block) return err(`Missing final text block ${index}`);
 
     const closeResult = await this.closeBlock(index);
-    if (!closeResult.ok) return closeResult;
+    if (isErr(closeResult)) return err(closeResult.error);
     this.lastClosedText = block.buffer;
     this.activeTextBlockIndex = null;
     return ok(undefined);
@@ -131,7 +131,7 @@ export class TelegramStreamDispatcher {
     let index = this.activeTextBlockIndex;
     if (index == null) {
       const openResult = await this.openBlock("text", {});
-      if (!openResult.ok) return openResult;
+      if (isErr(openResult)) return err(openResult.error);
       index = openResult.value.index;
       this.activeTextBlockIndex = index;
     }
@@ -156,24 +156,24 @@ export class TelegramStreamDispatcher {
 
   private async emitImmediateBlock(kind: TelegramBlockKind, content: string, meta: TelegramBlockMeta): Promise<Result<void, string>> {
     const closeActive = await this.closeActiveTextBlock();
-    if (!closeActive.ok) return closeActive;
+    if (isErr(closeActive)) return err(closeActive.error);
 
     const openResult = await this.openBlock(kind, meta);
-    if (!openResult.ok) return openResult;
+    if (isErr(openResult)) return err(openResult.error);
 
     const block = this.blocks.get(openResult.value.index);
     if (!block) return err(`Missing immediate block ${openResult.value.index}`);
     block.buffer = content;
 
     const closeResult = await this.closeBlock(block.index);
-    if (!closeResult.ok) return closeResult;
+    if (isErr(closeResult)) return err(closeResult.error);
     return ok(undefined);
   }
 
   private async closeActiveTextBlock(): Promise<Result<void, string>> {
     if (this.activeTextBlockIndex == null) return ok(undefined);
     const closeResult = await this.closeBlock(this.activeTextBlockIndex);
-    if (!closeResult.ok) return closeResult;
+    if (isErr(closeResult)) return err(closeResult.error);
     const block = this.blocks.get(this.activeTextBlockIndex);
     if (block) this.lastClosedText = block.buffer;
     this.activeTextBlockIndex = null;
@@ -189,9 +189,9 @@ export class TelegramStreamDispatcher {
       status: "streaming",
       meta,
     });
-    if (!openResult.ok) return openResult;
+    if (isErr(openResult)) return err(openResult.error);
     this.blocks.set(index, openResult.value);
-    return openResult;
+    return ok(openResult.value);
   }
 
   private async syncActiveBlockToLatestAssistant(): Promise<Result<void, string>> {
@@ -233,7 +233,7 @@ export class TelegramStreamDispatcher {
     if (block.status === "closed") return ok(undefined);
 
     const closeResult = await this.transport.flushBlock(this.chatId, block, true);
-    if (!closeResult.ok) return closeResult;
+    if (isErr(closeResult)) return err(closeResult.error);
     this.blocks.set(index, closeResult.value);
     return ok(undefined);
   }

@@ -27,7 +27,8 @@ export class WhatsAppAdapter extends BaseAdapter {
     }
     async initialize() {
         try {
-            const baileys = await import("@whiskeysockets/baileys");
+            const baileysModule = "@whiskeysockets/baileys";
+            const baileys = await import(baileysModule);
             const { state, saveCreds } = await baileys.useMultiFileAuthState(this.config.sessionPath || "./whatsapp-session");
             this.sock = baileys.makeWASocket({
                 auth: state,
@@ -247,3 +248,4 @@ export class WhatsAppAdapter extends BaseAdapter {
         return this.qrCode;
     }
 }
+//# sourceMappingURL=whatsapp.js.map

@@ -220,3 +220,4 @@ export class DiscordAdapter extends BaseAdapter {
         console.log(`[Discord] Registered ${commands.length} slash commands`);
     }
 }
+//# sourceMappingURL=discord.js.map

@@ -26,9 +26,6 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "npx tsx tests/index.ts",
-    "demo": "npx tsx tests/demo-server.ts",
-    "client": "npx tsx tests/client-demo.ts",
     "prepublishOnly": "rm -rf dist && tsc"
   },
   "dependencies": {

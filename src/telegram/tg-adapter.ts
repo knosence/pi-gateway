@@ -1,6 +1,6 @@
 import { formatBlock, placeholderForKind } from "./block-formatter.js";
 import { TelegramSendQueue } from "./send-queue.js";
-import { err, ok, type Result, type TelegramBlockState } from "./block-state.js";
+import { err, isErr, ok, type Result, type TelegramBlockState } from "./block-state.js";
 import { TelegramAdapter } from "../adapters/telegram.js";
 
 export class TelegramStreamAdapter {
@@ -23,7 +23,7 @@ export class TelegramStreamAdapter {
       },
     });
 
-    if (!sendResult.ok) return sendResult;
+    if (isErr(sendResult)) return err(sendResult.error);
 
     return ok({
       ...block,
@@ -34,7 +34,7 @@ export class TelegramStreamAdapter {
 
   async flushBlock(chatId: string, block: TelegramBlockState, force: boolean): Promise<Result<TelegramBlockState, string>> {
     const formatted = formatBlock(block.kind, block.meta, block.buffer, !force);
-    if (!formatted.ok) return formatted;
+    if (isErr(formatted)) return err(formatted.error);
 
     const editResult = await this.queue.enqueue(chatId, {
       kind: "edit",
@@ -50,7 +50,7 @@ export class TelegramStreamAdapter {
       },
     });
 
-    if (!editResult.ok) return editResult;
+    if (isErr(editResult)) return err(editResult.error);
 
     return ok({
       ...block,

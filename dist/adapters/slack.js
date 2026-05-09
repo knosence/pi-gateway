@@ -227,3 +227,4 @@ export class SlackAdapter extends BaseAdapter {
         }
     }
 }
+//# sourceMappingURL=slack.js.map

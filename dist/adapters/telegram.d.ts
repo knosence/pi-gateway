@@ -25,6 +25,7 @@ export declare class TelegramAdapter extends BaseAdapter {
     private offset;
     private pollingInterval;
     private connected;
+    private typingIntervals;
     constructor(config: TelegramConfig);
     initialize(): Promise<void>;
     private apiRequest;
@@ -34,6 +35,8 @@ export declare class TelegramAdapter extends BaseAdapter {
     private handleUpdate;
     private sleep;
     stop(): Promise<void>;
+    private splitMessage;
+    private sendSingleMessage;
     sendMessage(channelId: string, content: string): Promise<string>;
     sendPhoto(channelId: string, photoUrl: string, caption?: string): Promise<string>;
     sendButtons(channelId: string, text: string, buttons: Array<Array<{
@@ -42,6 +45,7 @@ export declare class TelegramAdapter extends BaseAdapter {
     }>>): Promise<string>;
     editMessage(channelId: string, messageId: string, content: string): Promise<void>;
     deleteMessage(channelId: string, messageId: string): Promise<void>;
+    private sendTypingAction;
     setTyping(channelId: string, isTyping: boolean): Promise<void>;
     getStatus(): Promise<{
         connected: boolean;

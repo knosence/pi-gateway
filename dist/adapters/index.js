@@ -5,3 +5,4 @@ export { TelegramAdapter } from "./telegram.js";
 export { SlackAdapter } from "./slack.js";
 export { WhatsAppAdapter } from "./whatsapp.js";
 export { WebSocketAdapter } from "./websocket.js";
+//# sourceMappingURL=index.js.map

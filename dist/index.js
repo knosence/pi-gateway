@@ -19,7 +19,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
-import { startGateway, stopGateway, getStatus, isRunning, getConfig, attachToExistingGateway, } from "./api.js";
+import { startGateway, stopGateway, getStatus, isRunning, getConfig, setConfig, attachToExistingGateway, isGatewayRunning, } from "./api.js";
 import { listSessions, } from "./sessions/store.js";
 import { approvePairingCode, generatePairingCode, listPendingPairingCodes, addToAllowlist, listAllowlistedUsers, } from "./security/auth.js";
 import { listTasks, } from "./background/manager.js";
@@ -236,7 +236,7 @@ export default async function (pi) {
     pi.registerCommand("gateway", {
         description: "Manage Hermes-style messaging gateway",
         getArgumentCompletions: (prefix) => {
-            const cmds = ["start", "stop", "status", "restart", "pair", "allow", "sessions", "tasks", "config"];
+            const cmds = ["start", "stop", "status", "restart", "pair", "allow", "sessions", "bind", "bind-current", "session-id", "telegram-mode", "unbind", "tasks", "config"];
             return cmds.filter(c => c.startsWith(prefix)).map(c => ({ value: c, label: c }));
         },
         handler: async (args, ctx) => {
@@ -295,6 +295,9 @@ export default async function (pi) {
                         `Session Reset: ${cfg.sessions.resetPolicy}`,
                         `  - Daily at ${cfg.sessions.dailyHour}:00`,
                         `  - Idle after ${cfg.sessions.idleMinutes} min`,
+                        `Session Bindings: ${Object.keys(cfg.sessions.bindings ?? {}).length}`,
+                        `Live Bridge: ${cfg.liveBridge?.enabled ? `${cfg.liveBridge.url} (${cfg.liveBridge.telegramMode ?? "balanced"})` : "disabled"}`,
+                        `Scoped Telegram Modes: ${Object.keys(cfg.liveBridge?.telegramModesByChat ?? {}).length}`,
                         "",
                         `Security: ${cfg.security.allowAll ? "Allow all" : "Allowlist only"}`,
                     ];
@@ -337,8 +340,113 @@ export default async function (pi) {
                 }
                 case "sessions": {
                     const sessions = await listSessions();
+                    const bindings = getConfig().sessions.bindings ?? {};
+                    const boundBySessionId = new Map(Object.entries(bindings).map(([k, v]) => [v, k]));
                     ctx.ui.notify("Active sessions:\n" +
-                        sessions.slice(0, 10).map(s => `${s.platform}:${s.channelId} (${s.id.slice(0, 8)}...)`).join("\n"), "info");
+                        sessions.slice(0, 10).map(s => {
+                            const bound = boundBySessionId.get(s.id);
+                            return `${s.platform}:${s.channelId} (${s.id.slice(0, 8)}...)${bound ? ` <= ${bound}` : ""}`;
+                        }).join("\n"), "info");
+                    return;
+                }
+                case "bind": {
+                    const platform = parts[1];
+                    const channelId = parts[2];
+                    const sessionId = parts[3];
+                    if (!platform || !channelId) {
+                        const bindings = getConfig().sessions.bindings ?? {};
+                        const lines = Object.entries(bindings).map(([k, v]) => `${k} -> ${v}`);
+                        ctx.ui.notify(`Session bindings:\n${lines.length ? lines.join("\n") : "None"}`, "info");
+                        return;
+                    }
+                    if (!sessionId) {
+                        ctx.ui.notify("Usage: /gateway bind <platform> <channelId> <sessionId>", "error");
+                        return;
+                    }
+                    const cfg = getConfig();
+                    cfg.sessions.bindings = cfg.sessions.bindings ?? {};
+                    cfg.sessions.bindings[`${platform}:${channelId}`] = sessionId;
+                    setConfig(cfg);
+                    ctx.ui.notify(`Bound ${platform}:${channelId} -> ${sessionId}`, "info");
+                    return;
+                }
+                case "bind-current": {
+                    const platform = parts[1];
+                    const channelId = parts[2];
+                    if (!platform || !channelId) {
+                        ctx.ui.notify("Usage: /gateway bind-current <platform> <channelId>", "error");
+                        return;
+                    }
+                    const sessionId = ctx.sessionManager.getSessionId();
+                    const cfg = getConfig();
+                    cfg.sessions.bindings = cfg.sessions.bindings ?? {};
+                    cfg.sessions.bindings[`${platform}:${channelId}`] = sessionId;
+                    setConfig(cfg);
+                    ctx.ui.notify(`Bound ${platform}:${channelId} -> current session ${sessionId}`, "info");
+                    return;
+                }
+                case "session-id": {
+                    const sessionId = ctx.sessionManager.getSessionId();
+                    const sessionFile = ctx.sessionManager.getSessionFile();
+                    ctx.ui.notify(`Current session:\nID: ${sessionId}\nFile: ${sessionFile ?? "(in-memory / none)"}`, "info");
+                    return;
+                }
+                case "unbind": {
+                    const platform = parts[1];
+                    const channelId = parts[2];
+                    if (!platform || !channelId) {
+                        ctx.ui.notify("Usage: /gateway unbind <platform> <channelId>", "error");
+                        return;
+                    }
+                    const cfg = getConfig();
+                    const key = `${platform}:${channelId}`;
+                    if (cfg.sessions.bindings?.[key]) {
+                        delete cfg.sessions.bindings[key];
+                        setConfig(cfg);
+                        ctx.ui.notify(`Removed binding for ${key}`, "info");
+                    }
+                    else {
+                        ctx.ui.notify(`No binding found for ${key}`, "info");
+                    }
+                    return;
+                }
+                case "telegram-mode": {
+                    const mode = parts[1];
+                    const platform = parts[2];
+                    const channelId = parts[3];
+                    const cfg = getConfig();
+                    const currentMode = cfg.liveBridge?.telegramMode ?? "balanced";
+                    const scopedModes = cfg.liveBridge?.telegramModesByChat ?? {};
+                    if (!mode) {
+                        const scopedLines = Object.entries(scopedModes).map(([key, value]) => `${key} -> ${value}`);
+                        ctx.ui.notify(`Telegram mode: ${currentMode}\nScoped modes:\n${scopedLines.length ? scopedLines.join("\n") : "None"}`, "info");
+                        return;
+                    }
+                    if (mode !== "clean" && mode !== "balanced" && mode !== "full" && mode !== "persistent") {
+                        ctx.ui.notify("Usage: /gateway telegram-mode <clean|balanced|full> [platform channelId]", "error");
+                        return;
+                    }
+                    cfg.liveBridge = {
+                        enabled: cfg.liveBridge?.enabled ?? false,
+                        url: cfg.liveBridge?.url ?? "http://127.0.0.1:8766",
+                        token: cfg.liveBridge?.token ?? "",
+                        timeoutMs: cfg.liveBridge?.timeoutMs ?? 600000,
+                        telegramMode: cfg.liveBridge?.telegramMode ?? "balanced",
+                        telegramModesByChat: { ...(cfg.liveBridge?.telegramModesByChat ?? {}) },
+                    };
+                    if ((platform && !channelId) || (!platform && channelId)) {
+                        ctx.ui.notify("Usage: /gateway telegram-mode <clean|balanced|full> [platform channelId]", "error");
+                        return;
+                    }
+                    if (platform && channelId) {
+                        cfg.liveBridge.telegramModesByChat[`${platform}:${channelId}`] = mode;
+                        setConfig(cfg);
+                        ctx.ui.notify(`Telegram mode for ${platform}:${channelId} set to ${mode}`, "info");
+                        return;
+                    }
+                    cfg.liveBridge.telegramMode = mode;
+                    setConfig(cfg);
+                    ctx.ui.notify(`Default Telegram mode set to ${mode}`, "info");
                     return;
                 }
                 case "tasks": {
@@ -352,6 +460,9 @@ export default async function (pi) {
                     ctx.ui.notify(`Gateway Config:\n\n` +
                         `Port: ${cfg.port}\n` +
                         `Sessions: ${cfg.sessions.resetPolicy}\n` +
+                        `Bindings: ${Object.keys(cfg.sessions.bindings ?? {}).length}\n` +
+                        `Live Bridge: ${cfg.liveBridge?.enabled ? `${cfg.liveBridge.url} (${cfg.liveBridge.telegramMode ?? "balanced"})` : "disabled"}\n` +
+                        `Scoped Telegram Modes: ${Object.keys(cfg.liveBridge?.telegramModesByChat ?? {}).length}\n` +
                         `Security: ${cfg.security.allowAll ? "Allow all" : "Allowlist"}\n` +
                         `Discord: ${cfg.platforms.discord?.enabled ? "Enabled" : "Disabled"}`, "info");
                     return;
@@ -365,6 +476,11 @@ export default async function (pi) {
                         "  /gateway pair <code>  - Approve pairing\n" +
                         "  /gateway allow <p> <u>- Add user to allowlist\n" +
                         "  /gateway sessions     - List sessions\n" +
+                        "  /gateway bind <p> <c> <s> - Bind chat to session\n" +
+                        "  /gateway bind-current <p> <c> - Bind chat to this live session\n" +
+                        "  /gateway session-id   - Show current live session ID\n" +
+                        "  /gateway telegram-mode <clean|balanced|full> [platform channelId] - Set default or per-chat Telegram mode\n" +
+                        "  /gateway unbind <p> <c>   - Remove chat/session binding\n" +
                         "  /gateway tasks        - List background tasks\n" +
                         "  /gateway config       - Show config\n\n" +
                         "Hermes-style features:\n" +
@@ -500,6 +616,18 @@ export default async function (pi) {
     // Notify on session start
     pi.on("session_start", async (_event, ctx) => {
         globalCtx = ctx;
+        if (!isRunning()) {
+            const cfg = getConfig();
+            const host = cfg.host === "localhost" ? "127.0.0.1" : cfg.host;
+            try {
+                if (await isGatewayRunning(cfg.port)) {
+                    await attachToExistingGateway(cfg.port, host);
+                }
+            }
+            catch {
+                // Ignore attach failures and fall back to local in-memory state.
+            }
+        }
         updateStatus();
     });
     // Re-export programmatic API so extension consumers can import from here too
@@ -507,3 +635,4 @@ export default async function (pi) {
 }
 // Re-export programmatic API for direct import
 export { startGateway, stopGateway, isGatewayRunning, getStatus, getConfig, isRunning, getAdapter, getAdapters, sendMessage, attachToExistingGateway, broadcast } from "./api.js";
+//# sourceMappingURL=index.js.map

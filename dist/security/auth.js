@@ -166,3 +166,4 @@ export function setSecurityConfig(config) {
     const updated = { ...current, ...config };
     writeFileSync(CONFIG_FILE, JSON.stringify(updated, null, 2));
 }
+//# sourceMappingURL=auth.js.map

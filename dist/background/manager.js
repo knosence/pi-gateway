@@ -206,3 +206,4 @@ function rowToTask(row) {
         deliveredAt: row.delivered_at ?? undefined,
     };
 }
+//# sourceMappingURL=manager.js.map

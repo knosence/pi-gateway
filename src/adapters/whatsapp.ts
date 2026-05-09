@@ -45,7 +45,8 @@ export class WhatsAppAdapter extends BaseAdapter {
 
   async initialize(): Promise<void> {
     try {
-      const baileys = await import("@whiskeysockets/baileys");
+      const baileysModule = "@whiskeysockets/baileys";
+      const baileys = await import(baileysModule);
       
       const { state, saveCreds } = await baileys.useMultiFileAuthState(this.config.sessionPath || "./whatsapp-session");
       

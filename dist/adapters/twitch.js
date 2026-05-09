@@ -218,3 +218,4 @@ export class TwitchAdapter extends BaseAdapter {
         return this.streamStatus.get(channel.toLowerCase()) || false;
     }
 }
+//# sourceMappingURL=twitch.js.map

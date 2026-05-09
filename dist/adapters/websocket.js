@@ -128,3 +128,4 @@ export class WebSocketAdapter extends BaseAdapter {
         await super.stop();
     }
 }
+//# sourceMappingURL=websocket.js.map

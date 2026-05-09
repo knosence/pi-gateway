@@ -112,7 +112,7 @@ export class TelegramAdapter extends BaseAdapter {
       return await fetch(url, {
         ...options,
         // Force IPv4 to avoid broken IPv6 routes timing out to api.telegram.org
-        dispatcher: TELEGRAM_IPV4_AGENT,
+        dispatcher: TELEGRAM_IPV4_AGENT as any,
         signal: options.signal ?? controller.signal,
         headers: {
           "Content-Type": "application/json",

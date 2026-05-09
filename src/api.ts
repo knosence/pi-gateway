@@ -51,6 +51,7 @@ import { SlackAdapter } from "./adapters/slack.js";
 import { WhatsAppAdapter } from "./adapters/whatsapp.js";
 import { BaseAdapter, type AdapterCallbacks, type PlatformMessage } from "./adapters/base.js";
 import { TelegramSendQueue } from "./telegram/send-queue.js";
+import { isErr } from "./telegram/block-state.js";
 import { TelegramStreamAdapter } from "./telegram/tg-adapter.js";
 import { TelegramStreamDispatcher } from "./telegram/stream-dispatcher.js";
 
@@ -812,13 +813,13 @@ const adapterCallbacks: AdapterCallbacks = {
 
           await promptViaLiveBridgeStream(message.content, async (event) => {
             const result = await dispatcher.onBridgeEvent(event);
-            if (!result.ok) {
+            if (isErr(result)) {
               console.warn(`[gateway] Telegram stream dispatch failed for ${session.id}: ${result.error}`);
             }
           });
 
           const flushResult = await dispatcher.streamEnd();
-          if (!flushResult.ok) {
+          if (isErr(flushResult)) {
             console.warn(`[gateway] Telegram stream flush failed for ${session.id}: ${flushResult.error}`);
           }
         } else {

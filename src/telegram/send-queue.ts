@@ -1,4 +1,4 @@
-import { err, ok, type Result } from "./block-state.js";
+import { err, isErr, ok, type Result } from "./block-state.js";
 
 type QueueOperation<T> = {
   kind: "send" | "edit";
@@ -51,13 +51,14 @@ export class TelegramSendQueue {
     while (true) {
       await this.applyThrottle(state, operation);
       const result = await operation.run();
-      if (result.ok) {
+      if (!isErr(result)) {
         this.recordSuccess(state, operation);
         return result;
       }
 
-      const retryAfterMs = parseRetryAfterMs(result.error);
-      if (retryAfterMs == null) return result;
+      const errorText = result.error;
+      const retryAfterMs = parseRetryAfterMs(errorText);
+      if (retryAfterMs == null) return err(errorText);
       await sleep(retryAfterMs);
       if (operation.kind === "send") {
         state.lastSendAt = 0;

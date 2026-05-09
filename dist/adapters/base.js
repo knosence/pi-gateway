@@ -27,3 +27,4 @@ export class BaseAdapter {
         return `${this.platform}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
 }
+//# sourceMappingURL=base.js.map

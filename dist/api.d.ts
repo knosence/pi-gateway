@@ -8,6 +8,7 @@
  * the extension factory attaches to the already-running instance.
  */
 import { BaseAdapter } from "./adapters/base.js";
+type TelegramMode = "clean" | "balanced" | "full" | "persistent";
 export interface GatewayConfig {
     port: number;
     host: string;
@@ -23,6 +24,16 @@ export interface GatewayConfig {
         resetPolicy: "daily" | "idle" | "both";
         dailyHour: number;
         idleMinutes: number;
+        bindings?: Record<string, string>;
+    };
+    liveBridge?: {
+        enabled: boolean;
+        url: string;
+        token: string;
+        timeoutMs?: number;
+        telegramMode?: TelegramMode;
+        telegramModesByChat?: Record<string, TelegramMode>;
+        autoDiscover?: boolean;
     };
     platforms: {
         discord?: {
@@ -95,6 +106,10 @@ export declare function getStatus(): GatewayStatus;
  */
 export declare function getConfig(): GatewayConfig;
 /**
+ * Update gateway config and persist it.
+ */
+export declare function setConfig(nextConfig: GatewayConfig): GatewayConfig;
+/**
  * Check if the gateway is running.
  */
 export declare function isRunning(): boolean;
@@ -118,3 +133,4 @@ export declare function attachToExistingGateway(port?: number, host?: string): P
  * Broadcast a message to all connected WebSocket clients.
  */
 export declare function broadcast(event: string, data: unknown): void;
+export {};

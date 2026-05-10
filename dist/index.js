@@ -44,6 +44,53 @@ function getGatewayStartErrorMessage(err) {
     }
     return `⚠️ Gateway start failed: ${error?.message ?? String(err)}`;
 }
+async function inspectJsonEndpoint(url) {
+    try {
+        const response = await fetch(url);
+        const text = await response.text();
+        let body = undefined;
+        try {
+            body = text ? JSON.parse(text) : undefined;
+        }
+        catch {
+            body = text;
+        }
+        return { ok: response.ok, status: response.status, body };
+    }
+    catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+}
+async function buildGatewayDoctorReport() {
+    const cfg = getConfig();
+    const gatewayHost = cfg.host === "0.0.0.0" ? "127.0.0.1" : (cfg.host || "127.0.0.1");
+    const gatewayUrl = `http://${gatewayHost}:${cfg.port}/api/status`;
+    const bridgeUrl = cfg.liveBridge?.url ? `${cfg.liveBridge.url.replace(/\/$/, "")}/health` : null;
+    const gatewayCheck = await inspectJsonEndpoint(gatewayUrl);
+    const bridgeCheck = bridgeUrl ? await inspectJsonEndpoint(bridgeUrl) : null;
+    const bindings = Object.keys(cfg.sessions.bindings ?? {});
+    const sessions = await listSessions();
+    const telegramSessions = sessions.filter((session) => session.platform === "telegram");
+    return [
+        `Gateway endpoint: ${gatewayCheck.ok ? "✅" : "❌"} ${gatewayUrl}`,
+        gatewayCheck.ok
+            ? `  running=${gatewayCheck.body?.running ?? "?"} adapters=${Array.isArray(gatewayCheck.body?.adapters) ? gatewayCheck.body.adapters.join(",") : "?"} sessions=${gatewayCheck.body?.sessions ?? "?"}`
+            : `  ${gatewayCheck.error ?? `HTTP ${gatewayCheck.status}`}`,
+        `Live bridge: ${bridgeUrl ? (bridgeCheck?.ok ? "✅" : "❌") : "➖"} ${bridgeUrl ?? "disabled"}`,
+        bridgeUrl
+            ? bridgeCheck?.ok
+                ? `  sessionId=${bridgeCheck.body?.sessionId ?? "?"} busy=${bridgeCheck.body?.busy ?? "?"} pendingPrompts=${bridgeCheck.body?.pendingPrompts ?? "?"}`
+                : `  ${bridgeCheck?.error ?? `HTTP ${bridgeCheck?.status}`}`
+            : "  Live bridge disabled",
+        `Telegram adapter enabled: ${cfg.platforms.telegram?.enabled ? "yes" : "no"}`,
+        `Telegram mode: ${cfg.liveBridge?.telegramMode ?? "balanced"}`,
+        `Session bindings: ${bindings.length}`,
+        ...bindings.slice(0, 5).map((binding) => `  - ${binding} -> ${cfg.sessions.bindings?.[binding]}`),
+        `Stored telegram sessions: ${telegramSessions.length}`,
+        ...telegramSessions.slice(0, 5).map((session) => `  - ${session.channelId} => ${session.id}`),
+        `Preferred stable path: app/client session -> live bridge -> gateway -> Telegram final reply`,
+    ];
+}
 async function inspectPortConflict(port) {
     const info = {
         port,
@@ -236,7 +283,7 @@ export default async function (pi) {
     pi.registerCommand("gateway", {
         description: "Manage Hermes-style messaging gateway",
         getArgumentCompletions: (prefix) => {
-            const cmds = ["start", "stop", "status", "restart", "pair", "allow", "sessions", "bind", "bind-current", "session-id", "telegram-mode", "unbind", "tasks", "config"];
+            const cmds = ["start", "stop", "status", "restart", "pair", "allow", "sessions", "bind", "bind-current", "session-id", "telegram-mode", "doctor", "unbind", "tasks", "config"];
             return cmds.filter(c => c.startsWith(prefix)).map(c => ({ value: c, label: c }));
         },
         handler: async (args, ctx) => {
@@ -449,6 +496,12 @@ export default async function (pi) {
                     ctx.ui.notify(`Default Telegram mode set to ${mode}`, "info");
                     return;
                 }
+                case "doctor": {
+                    const lines = await buildGatewayDoctorReport();
+                    ctx.ui.setWidget("gateway-doctor", lines, { placement: "belowEditor" });
+                    setTimeout(() => ctx.ui.setWidget("gateway-doctor", undefined), 20000);
+                    return;
+                }
                 case "tasks": {
                     const tasks = await listTasks();
                     ctx.ui.notify("Background tasks:\n" +
@@ -480,6 +533,7 @@ export default async function (pi) {
                         "  /gateway bind-current <p> <c> - Bind chat to this live session\n" +
                         "  /gateway session-id   - Show current live session ID\n" +
                         "  /gateway telegram-mode <clean|balanced|full> [platform channelId] - Set default or per-chat Telegram mode\n" +
+                        "  /gateway doctor       - Check gateway, bridge, and session health\n" +
                         "  /gateway unbind <p> <c>   - Remove chat/session binding\n" +
                         "  /gateway tasks        - List background tasks\n" +
                         "  /gateway config       - Show config\n\n" +

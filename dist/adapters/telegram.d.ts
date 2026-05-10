@@ -45,6 +45,7 @@ export declare class TelegramAdapter extends BaseAdapter {
     }>>): Promise<string>;
     editMessage(channelId: string, messageId: string, content: string): Promise<void>;
     deleteMessage(channelId: string, messageId: string): Promise<void>;
+    private parseRetryAfterMs;
     private sendTypingAction;
     setTyping(channelId: string, isTyping: boolean): Promise<void>;
     getStatus(): Promise<{

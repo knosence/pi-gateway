@@ -28,6 +28,7 @@ pi install npm:@0xkobold/pi-kobold
 - **Rate Limiting** — Configurable per-identifier rate limiting
 - **Multi-Platform Adapters** — Discord, Telegram, Slack, WhatsApp, Twitch, WebSocket
 - **Interactive Port Conflict Recovery** — Smarter recovery when the gateway port is already in use
+- **Stable Telegram Baseline** — Normal Telegram mode now prefers one final reply instead of edit-heavy streaming, and respects Telegram `retry after` backoff when rate-limited
 
 ## Architecture
 
@@ -61,6 +62,7 @@ pi install npm:@0xkobold/pi-kobold
 | `/gateway sessions` | List active sessions |
 | `/gateway tasks` | List background tasks |
 | `/gateway config` | Show configuration |
+| `/gateway doctor` | Check gateway, bridge, bindings, and session health |
 
 ## Tools
 
@@ -70,6 +72,17 @@ pi install npm:@0xkobold/pi-kobold
 | `gateway_sessions` | List active sessions |
 | `gateway_background_tasks` | List and manage background tasks |
 | `gateway_pairing` | Generate, list, or approve pairing codes |
+
+## Preferred stable path
+
+For day-to-day use, the preferred stable path is:
+
+1. app/client session resolution
+2. live bridge prompt execution
+3. gateway delivery
+4. Telegram final reply delivery
+
+Telegram `clean` and `balanced` modes are intentionally final-reply oriented so the transport stays reliable under rate limits. Use `full` only when you explicitly want richer streaming-style Telegram updates.
 
 ## Programmatic API
 

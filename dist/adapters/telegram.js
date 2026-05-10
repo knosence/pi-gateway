@@ -221,30 +221,44 @@ export class TelegramAdapter extends BaseAdapter {
         return chunks.filter(Boolean);
     }
     async sendSingleMessage(channelId, content) {
-        let response = await this.apiRequest("/sendMessage", {
-            method: "POST",
-            body: JSON.stringify({
-                chat_id: channelId,
-                text: content,
-                parse_mode: "HTML",
-            }),
-        });
-        let data = await response.json();
-        if (!data.ok) {
-            console.warn(`[Telegram] HTML send failed, retrying as plain text: ${data.description || "unknown error"}`);
-            response = await this.apiRequest("/sendMessage", {
+        while (true) {
+            let response = await this.apiRequest("/sendMessage", {
                 method: "POST",
                 body: JSON.stringify({
                     chat_id: channelId,
                     text: content,
+                    parse_mode: "HTML",
                 }),
             });
-            data = await response.json();
+            let data = await response.json();
+            const retryAfterMs = this.parseRetryAfterMs(data.description);
+            if (!data.ok && retryAfterMs != null) {
+                console.warn(`[Telegram] Send rate-limited, retrying in ${Math.ceil(retryAfterMs / 1000)}s`);
+                await this.sleep(retryAfterMs);
+                continue;
+            }
+            if (!data.ok) {
+                console.warn(`[Telegram] HTML send failed, retrying as plain text: ${data.description || "unknown error"}`);
+                response = await this.apiRequest("/sendMessage", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        chat_id: channelId,
+                        text: content,
+                    }),
+                });
+                data = await response.json();
+            }
+            if (!data.ok) {
+                const plainRetryAfterMs = this.parseRetryAfterMs(data.description);
+                if (plainRetryAfterMs != null) {
+                    console.warn(`[Telegram] Plain-text send rate-limited, retrying in ${Math.ceil(plainRetryAfterMs / 1000)}s`);
+                    await this.sleep(plainRetryAfterMs);
+                    continue;
+                }
+                throw new Error(`Failed to send message (${response.status}): ${data.description || "unknown error"}`);
+            }
+            return String(data.result?.message_id || 0);
         }
-        if (!data.ok) {
-            throw new Error(`Failed to send message (${response.status}): ${data.description || "unknown error"}`);
-        }
-        return String(data.result?.message_id || 0);
     }
     async sendMessage(channelId, content) {
         const chunks = this.splitMessage(content);
@@ -290,30 +304,45 @@ export class TelegramAdapter extends BaseAdapter {
         return String(data.result?.message_id || 0);
     }
     async editMessage(channelId, messageId, content) {
-        let response = await this.apiRequest("/editMessageText", {
-            method: "POST",
-            body: JSON.stringify({
-                chat_id: channelId,
-                message_id: parseInt(messageId),
-                text: content,
-                parse_mode: "HTML",
-            }),
-        });
-        let data = await response.json();
-        if (!data.ok) {
-            console.warn(`[Telegram] HTML edit failed, retrying as plain text: ${data.description || "unknown error"}`);
-            response = await this.apiRequest("/editMessageText", {
+        while (true) {
+            let response = await this.apiRequest("/editMessageText", {
                 method: "POST",
                 body: JSON.stringify({
                     chat_id: channelId,
                     message_id: parseInt(messageId),
                     text: content,
+                    parse_mode: "HTML",
                 }),
             });
-            data = await response.json();
-        }
-        if (!data.ok) {
-            throw new Error(`Failed to edit message (${response.status}): ${data.description || "unknown error"}`);
+            let data = await response.json();
+            const retryAfterMs = this.parseRetryAfterMs(data.description);
+            if (!data.ok && retryAfterMs != null) {
+                console.warn(`[Telegram] Edit rate-limited, retrying in ${Math.ceil(retryAfterMs / 1000)}s`);
+                await this.sleep(retryAfterMs);
+                continue;
+            }
+            if (!data.ok) {
+                console.warn(`[Telegram] HTML edit failed, retrying as plain text: ${data.description || "unknown error"}`);
+                response = await this.apiRequest("/editMessageText", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        chat_id: channelId,
+                        message_id: parseInt(messageId),
+                        text: content,
+                    }),
+                });
+                data = await response.json();
+            }
+            if (!data.ok) {
+                const plainRetryAfterMs = this.parseRetryAfterMs(data.description);
+                if (plainRetryAfterMs != null) {
+                    console.warn(`[Telegram] Plain-text edit rate-limited, retrying in ${Math.ceil(plainRetryAfterMs / 1000)}s`);
+                    await this.sleep(plainRetryAfterMs);
+                    continue;
+                }
+                throw new Error(`Failed to edit message (${response.status}): ${data.description || "unknown error"}`);
+            }
+            return;
         }
     }
     async deleteMessage(channelId, messageId) {
@@ -324,6 +353,10 @@ export class TelegramAdapter extends BaseAdapter {
                 message_id: parseInt(messageId),
             }),
         });
+    }
+    parseRetryAfterMs(description) {
+        const match = description?.match(/retry after\s+(\d+)/i);
+        return match ? Number(match[1]) * 1000 : null;
     }
     async sendTypingAction(channelId) {
         const response = await this.apiRequest("/sendChatAction", {

@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { randomBytes } from "node:crypto";
 const KOBOLD_DIR = join(homedir(), ".0xkobold");
+const GATEWAY_DIR = join(KOBOLD_DIR, "gateway");
 const SECURITY_DB = join(KOBOLD_DIR, "gateway-security.db");
 let db = null;
 export async function initSecurityStore() {
@@ -145,11 +146,28 @@ export async function cleanupExpiredCodes() {
     return result.changes;
 }
 const CONFIG_FILE = join(KOBOLD_DIR, "gateway-security.json");
+const GATEWAY_CONFIG_FILE = join(GATEWAY_DIR, "config.json");
 function getSecurityConfig() {
     try {
         if (existsSync(CONFIG_FILE)) {
             const content = readFileSync(CONFIG_FILE, "utf-8");
             return JSON.parse(content);
+        }
+    }
+    catch {
+        // Ignore
+    }
+    try {
+        if (existsSync(GATEWAY_CONFIG_FILE)) {
+            const content = readFileSync(GATEWAY_CONFIG_FILE, "utf-8");
+            const parsed = JSON.parse(content);
+            if (parsed.security) {
+                return {
+                    allowAll: parsed.security.allowAll ?? false,
+                    requirePairing: parsed.security.requirePairing ?? false,
+                    rateLimit: { maxRequests: 60, windowMs: 60000 },
+                };
+            }
         }
     }
     catch {

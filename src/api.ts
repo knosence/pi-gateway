@@ -806,21 +806,30 @@ const adapterCallbacks: AdapterCallbacks = {
         const adapter = adapters.get(session.platform);
 
         if (session.platform === "telegram" && adapter instanceof TelegramAdapter) {
-          const dispatcher = new TelegramStreamDispatcher(
-            session.channelId,
-            new TelegramStreamAdapter(adapter, telegramSendQueue),
-          );
+          const telegramMode = getTelegramModeForSession(session);
 
-          await promptViaLiveBridgeStream(message.content, async (event) => {
-            const result = await dispatcher.onBridgeEvent(event);
-            if (isErr(result)) {
-              console.warn(`[gateway] Telegram stream dispatch failed for ${session.id}: ${result.error}`);
+          if (telegramMode === "full") {
+            const dispatcher = new TelegramStreamDispatcher(
+              session.channelId,
+              new TelegramStreamAdapter(adapter, telegramSendQueue),
+            );
+
+            await promptViaLiveBridgeStream(message.content, async (event) => {
+              const result = await dispatcher.onBridgeEvent(event);
+              if (isErr(result)) {
+                console.warn(`[gateway] Telegram stream dispatch failed for ${session.id}: ${result.error}`);
+              }
+            });
+
+            const flushResult = await dispatcher.streamEnd();
+            if (isErr(flushResult)) {
+              console.warn(`[gateway] Telegram stream flush failed for ${session.id}: ${flushResult.error}`);
             }
-          });
-
-          const flushResult = await dispatcher.streamEnd();
-          if (isErr(flushResult)) {
-            console.warn(`[gateway] Telegram stream flush failed for ${session.id}: ${flushResult.error}`);
+          } else {
+            const text = await promptViaLiveBridgeStream(message.content, async () => {});
+            if (text) {
+              await adapter.sendMessage(session.channelId, text);
+            }
           }
         } else {
           const text = await promptViaLiveBridgeStream(message.content, async () => {});

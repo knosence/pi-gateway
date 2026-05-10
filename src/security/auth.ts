@@ -29,6 +29,7 @@ interface RateLimitEntry {
 }
 
 const KOBOLD_DIR = join(homedir(), ".0xkobold");
+const GATEWAY_DIR = join(KOBOLD_DIR, "gateway");
 const SECURITY_DB = join(KOBOLD_DIR, "gateway-security.db");
 
 let db: Database | null = null;
@@ -218,6 +219,7 @@ interface SecurityConfig {
 }
 
 const CONFIG_FILE = join(KOBOLD_DIR, "gateway-security.json");
+const GATEWAY_CONFIG_FILE = join(GATEWAY_DIR, "config.json");
 
 function getSecurityConfig(): SecurityConfig {
   try {
@@ -228,6 +230,25 @@ function getSecurityConfig(): SecurityConfig {
   } catch {
     // Ignore
   }
+
+  try {
+    if (existsSync(GATEWAY_CONFIG_FILE)) {
+      const content = readFileSync(GATEWAY_CONFIG_FILE, "utf-8");
+      const parsed = JSON.parse(content) as {
+        security?: { allowAll?: boolean; requirePairing?: boolean };
+      };
+      if (parsed.security) {
+        return {
+          allowAll: parsed.security.allowAll ?? false,
+          requirePairing: parsed.security.requirePairing ?? false,
+          rateLimit: { maxRequests: 60, windowMs: 60000 },
+        };
+      }
+    }
+  } catch {
+    // Ignore
+  }
+
   return {
     allowAll: false,
     requirePairing: false,
